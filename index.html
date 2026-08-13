@@ -1,0 +1,1994 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Order System with Cashier POS</title>
+  
+  <!-- Tailwind CSS for styling -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  
+  <!-- Babel for in-browser JSX compilation -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  
+  <!-- html2canvas for generating receipt images -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+  
+  <!-- Import Map to resolve module imports -->
+  <script type="importmap">
+    {
+      "imports": {
+        "react": "https://esm.sh/react@18.2.0",
+        "react-dom/client": "https://esm.sh/react-dom@18.2.0/client",
+        "lucide-react": "https://esm.sh/lucide-react@0.294.0?external=react",
+        "firebase/app": "https://www.gstatic.com/firebasejs/10.8.1/firebase-app.js",
+        "firebase/auth": "https://www.gstatic.com/firebasejs/10.8.1/firebase-auth.js",
+        "firebase/firestore": "https://www.gstatic.com/firebasejs/10.8.1/firebase-firestore.js"
+      }
+    }
+  </script>
+  
+  <style>
+    /* Prevent pull-to-refresh on mobile */
+    body { overscroll-behavior-y: none; }
+    /* Safe area padding for modern phones */
+    .pb-safe { padding-bottom: env(safe-area-inset-bottom); }
+    /* Print Stylesheet for POS Thermal Receipt Printer */
+    @media print {
+      body * { visibility: hidden !important; }
+      #printable-receipt, #printable-receipt * { visibility: visible !important; }
+      #printable-receipt {
+        position: absolute;
+        left: 0;
+        top: 0;
+        width: 100%;
+        margin: 0;
+        padding: 10px;
+        color: #000;
+        background: #fff;
+      }
+    }
+  </style>
+</head>
+<body class="bg-gray-50 text-slate-900">
+  <div id="root"></div>
+
+  <script type="text/babel" data-type="module">
+    import React, { useState, useEffect, useRef } from 'react';
+    import { createRoot } from 'react-dom/client';
+    import { initializeApp } from 'firebase/app';
+    import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+    import { getFirestore, collection, onSnapshot, doc, setDoc, addDoc, updateDoc, deleteDoc, query } from 'firebase/firestore';
+    import { 
+      ShoppingCart, Plus, Minus, Trash2, Edit2, Image as ImageIcon, Bell, CheckCircle, Clock, X, LogIn, LogOut, 
+      LayoutDashboard, UtensilsCrossed, Settings, Info, Activity, ClipboardList, TrendingUp, CalendarDays, DollarSign, 
+      AlertTriangle, Flame, Award, Filter, ChevronDown, ChevronUp, Shield, Lock, Code, Copy,
+      Printer, MessageCircle, CreditCard, Banknote, Receipt, Search, Check, Phone
+    } from 'lucide-react';
+
+    let firebaseConfig;
+    try {
+        firebaseConfig = typeof window.__firebase_config !== 'undefined' 
+            ? JSON.parse(window.__firebase_config) 
+            : {
+                apiKey: "AIzaSyAIkkD83uudTgRwghHWG4YYToa01URzuMc",
+                authDomain: "fegt01.firebaseapp.com",
+                projectId: "fegt01",
+                storageBucket: "fegt01.firebasestorage.app",
+                messagingSenderId: "928072192355",
+                appId: "1:928072192355:web:ff35c3bde1f7ed1ef80356"
+              };
+    } catch(e) {
+        console.error("Config parsing error:", e);
+    }
+    
+    let app, auth, db;
+    try {
+        app = initializeApp(firebaseConfig);
+        auth = getAuth(app);
+        db = getFirestore(app);
+    } catch (e) {
+        console.error("Firebase init error:", e);
+    }
+    
+    const appId = typeof window.__app_id !== 'undefined' ? window.__app_id : 'fegt01';
+
+    const formatRM = (amount) => `RM ${parseFloat(amount || 0).toFixed(2)}`;
+
+    const compressImage = (file) => {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.readAsDataURL(file);
+        reader.onload = (event) => {
+          const img = new Image();
+          img.src = event.target.result;
+          img.onload = () => {
+            const canvas = document.createElement('canvas');
+            const MAX_WIDTH = 400; 
+            let scaleSize = 1;
+            if (img.width > MAX_WIDTH) {
+              scaleSize = MAX_WIDTH / img.width;
+            }
+            canvas.width = img.width * scaleSize;
+            canvas.height = img.height * scaleSize;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+            
+            const compressedBase64 = canvas.toDataURL('image/webp', 0.5);
+            resolve(compressedBase64);
+          };
+          img.onerror = (err) => reject(err);
+        };
+        reader.onerror = error => reject(error);
+      });
+    };
+
+    const getBase64SizeInKB = (base64String) => {
+      if (!base64String) return 0;
+      const base64Data = base64String.split(',')[1] || base64String;
+      const padding = (base64Data.match(/(=*)$/) || [])[1].length;
+      const sizeInBytes = (base64Data.length * (3 / 4)) - padding;
+      return sizeInBytes / 1024;
+    };
+
+    function App() {
+      const [user, setUser] = useState(null);
+      const [userRole, setUserRole] = useState('customer');
+      const [showAdminLogin, setShowAdminLogin] = useState(false);
+      const [adminPin, setAdminPin] = useState('');
+      const [isWaiterBoardOpen, setIsWaiterBoardOpen] = useState(false);
+      
+      const [menuItems, setMenuItems] = useState([]);
+      const [orders, setOrders] = useState([]);
+      const [loading, setLoading] = useState(true);
+
+      const [appConfig, setAppConfig] = useState({ 
+          isRestricted: false, 
+          subMessage: 'System is currently disabled. Please contact the administrator regarding the monthly subscription.',
+          pins: { architect: '7777', admin: '1234', manager: '9999', cashier: '1111', waiter: '5678' }
+      });
+      const [architectMessageInput, setArchitectMessageInput] = useState('');
+      const [pinConfig, setPinConfig] = useState({ architect: '7777', admin: '1234', manager: '9999', cashier: '1111', waiter: '5678' });
+      const [newFirebaseConfig, setNewFirebaseConfig] = useState(`{\n  apiKey: "YOUR_API_KEY",\n  authDomain: "your-app.firebaseapp.com",\n  projectId: "your-app",\n  storageBucket: "your-app.firebasestorage.app",\n  messagingSenderId: "123456789",\n  appId: "1:123456789:web:abcdef"\n}`);
+      const [copiedAction, setCopiedAction] = useState(false);
+
+      const [cart, setCart] = useState([]);
+      const [isCartOpen, setIsCartOpen] = useState(false);
+      const [expandedMobileItems, setExpandedMobileItems] = useState({}); 
+      
+      const [isCheckoutModalOpen, setIsCheckoutModalOpen] = useState(false);
+      const [tableNumber, setTableNumber] = useState('1');
+      const [diningOption, setDiningOption] = useState('dine-in'); 
+      const [customerNote, setCustomerNote] = useState('');
+      const [customerPhone, setCustomerPhone] = useState(''); 
+
+      const [activeTab, setActiveTab] = useState('orders'); 
+      const [editingItem, setEditingItem] = useState(null);
+      const [eraseTarget, setEraseTarget] = useState(null); 
+      const [isErasing, setIsErasing] = useState(false);
+      
+      const [cashierSearch, setCashierSearch] = useState('');
+      const [cashierFilter, setCashierFilter] = useState('all'); 
+      const [receiptModalOrder, setReceiptModalOrder] = useState(null);
+      const [promptWhatsAppOrder, setPromptWhatsAppOrder] = useState(null);
+      const [customWhatsAppPhone, setCustomWhatsAppPhone] = useState('');
+
+      const [statsTimeframe, setStatsTimeframe] = useState('today');
+
+      useEffect(() => {
+        if(!auth) {
+            setLoading(false);
+            return;
+        }
+        
+        let isMounted = true;
+        
+        const initAuth = async () => {
+          try {
+            if (typeof window.__initial_auth_token !== 'undefined' && window.__initial_auth_token) {
+              await signInWithCustomToken(auth, window.__initial_auth_token);
+            } else {
+              await signInAnonymously(auth);
+            }
+          } catch (error) {
+            console.error("Auth Error:", error);
+          }
+        };
+        
+        initAuth();
+        
+        const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+          if (isMounted) {
+              setUser(currentUser);
+              setLoading(false);
+          }
+        });
+        
+        return () => {
+            isMounted = false;
+            unsubscribe();
+        };
+      }, []);
+
+      useEffect(() => {
+        if (!user || !db) return;
+
+        const menuRef = collection(db, 'artifacts', appId, 'public', 'data', 'menu');
+        const unsubscribeMenu = onSnapshot(query(menuRef), 
+          (snapshot) => {
+            const items = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            setMenuItems(items);
+          },
+          (error) => console.error("Menu fetch error:", error)
+        );
+
+        const ordersRef = collection(db, 'artifacts', appId, 'public', 'data', 'orders');
+        const unsubscribeOrders = onSnapshot(query(ordersRef),
+          (snapshot) => {
+            const fetchedOrders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            fetchedOrders.sort((a, b) => b.timestamp - a.timestamp);
+            setOrders(fetchedOrders);
+          },
+          (error) => console.error("Orders fetch error:", error)
+        );
+
+        const configRef = doc(db, 'artifacts', appId, 'public', 'data', 'appSettings', 'config');
+        const unsubscribeConfig = onSnapshot(configRef, 
+          (docSnap) => {
+            if (docSnap.exists()) {
+                const data = docSnap.data();
+                setAppConfig(data);
+                setArchitectMessageInput(data.subMessage || '');
+                if (data.pins) {
+                    setPinConfig({
+                      architect: '7777',
+                      admin: '1234',
+                      manager: '9999',
+                      cashier: '1111',
+                      waiter: '5678',
+                      ...data.pins
+                    });
+                }
+            } else {
+                const defaultConfig = { 
+                    isRestricted: false, 
+                    subMessage: 'System is currently disabled. Please contact the administrator regarding the monthly subscription.',
+                    pins: { architect: '7777', admin: '1234', manager: '9999', cashier: '1111', waiter: '5678' }
+                };
+                setDoc(configRef, defaultConfig);
+            }
+          },
+          (error) => console.error("Config fetch error:", error)
+        );
+
+        return () => {
+          unsubscribeMenu();
+          unsubscribeOrders();
+          unsubscribeConfig();
+        };
+      }, [user]);
+
+      const addToCart = (item) => {
+        setCart(prev => {
+          const existing = prev.find(i => i.id === item.id);
+          if (existing) {
+            return prev.map(i => i.id === item.id ? { ...i, qty: i.qty + 1 } : i);
+          }
+          return [...prev, { ...item, qty: 1 }];
+        });
+      };
+
+      const updateCartQty = (id, delta) => {
+        setCart(prev => prev.map(item => {
+          if (item.id === id) {
+            const newQty = item.qty + delta;
+            return newQty > 0 ? { ...item, qty: newQty } : null;
+          }
+          return item;
+        }).filter(Boolean));
+      };
+
+      const toggleMobileExpand = (itemId) => {
+        setExpandedMobileItems(prev => ({
+          ...prev,
+          [itemId]: !prev[itemId]
+        }));
+      };
+
+      const cartTotal = cart.reduce((sum, item) => sum + (item.price * item.qty), 0);
+
+      const openCheckoutPrompt = () => {
+        if (cart.length === 0) return;
+        setIsCartOpen(false);
+        setIsCheckoutModalOpen(true);
+      };
+
+      const submitOrder = async (e) => {
+        if (e) e.preventDefault();
+        if (cart.length === 0 || !user || !db) return;
+        
+        try {
+          const ordersRef = collection(db, 'artifacts', appId, 'public', 'data', 'orders');
+          await addDoc(ordersRef, {
+            customerUserId: user.uid,
+            items: cart,
+            total: cartTotal,
+            tableNumber: diningOption === 'dine-in' ? (tableNumber || 'N/A') : 'Takeaway',
+            diningOption,
+            customerNote: customerNote.trim(),
+            customerPhone: customerPhone.trim(), 
+            paymentStatus: 'unpaid', 
+            paymentMethod: 'pending',
+            status: 'pending',
+            timestamp: Date.now()
+          });
+          setCart([]);
+          setIsCheckoutModalOpen(false);
+          setCustomerNote('');
+          setCustomerPhone('');
+        } catch (error) {
+          console.error("Order submission failed:", error);
+        }
+      };
+
+      const handleAdminLogin = (e) => {
+        e.preventDefault();
+        const pins = appConfig?.pins || { architect: '7777', admin: '1234', manager: '9999', cashier: '1111', waiter: '5678' };
+
+        if (adminPin === pins.architect || adminPin === '7777') { 
+          setUserRole('architect');
+          setActiveTab('orders');
+          setShowAdminLogin(false);
+          setAdminPin('');
+        } else if (adminPin === pins.admin) { 
+          setUserRole('admin');
+          setActiveTab('orders');
+          setShowAdminLogin(false);
+          setAdminPin('');
+        } else if (adminPin === pins.manager) { 
+          setUserRole('manager');
+          setActiveTab('orders');
+          setShowAdminLogin(false);
+          setAdminPin('');
+        } else if (adminPin === pins.cashier) { 
+          setUserRole('cashier');
+          setActiveTab('cashier'); 
+          setShowAdminLogin(false);
+          setAdminPin('');
+        } else if (adminPin === pins.waiter) { 
+          setUserRole('waiter');
+          setShowAdminLogin(false);
+          setAdminPin('');
+          setIsWaiterBoardOpen(true); 
+        } else {
+          setAdminPin('');
+        }
+      };
+
+      const handleAdminLogout = () => {
+        setUserRole('customer');
+        setActiveTab('orders');
+        setIsWaiterBoardOpen(false);
+      };
+
+      const updateOrderStatus = async (orderId, newStatus) => {
+        if(!db) return;
+        try {
+          const orderRef = doc(db, 'artifacts', appId, 'public', 'data', 'orders', orderId);
+          await updateDoc(orderRef, { status: newStatus });
+        } catch (err) {
+          console.error("Failed to update status:", err);
+        }
+      };
+
+      const updatePaymentStatus = async (orderId, paymentStatus, paymentMethod = 'Cash') => {
+        if(!db) return;
+        try {
+          const orderRef = doc(db, 'artifacts', appId, 'public', 'data', 'orders', orderId);
+          await updateDoc(orderRef, { paymentStatus, paymentMethod });
+        } catch (err) {
+          console.error("Failed to update payment status:", err);
+        }
+      };
+      
+      const updateAppConfig = async (newConfig) => {
+        if(!db) return;
+        const configRef = doc(db, 'artifacts', appId, 'public', 'data', 'appSettings', 'config');
+        try {
+            await setDoc(configRef, { ...appConfig, ...newConfig }, { merge: true });
+        } catch (err) {
+            console.error("Failed to update app config:", err);
+        }
+      };
+
+      const saveMenuItem = async (e) => {
+        e.preventDefault();
+        if(!db) return;
+        const formData = new FormData(e.target);
+        const file = formData.get('imageFile');
+        
+        let base64Image = editingItem?.image || '';
+        
+        if (file && file.size > 0) {
+          base64Image = await compressImage(file);
+        }
+
+        const itemData = {
+          name: formData.get('name'),
+          category: formData.get('category'),
+          description: formData.get('description'),
+          price: parseFloat(formData.get('price')),
+          available: formData.get('available') === 'on',
+          image: base64Image
+        };
+
+        try {
+          if (editingItem && editingItem.id) {
+            await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'menu', editingItem.id), itemData);
+          } else {
+            await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'menu'), itemData);
+          }
+          setEditingItem(null);
+        } catch (err) {
+          console.error("Failed to save menu item:", err);
+        }
+      };
+
+      const deleteMenuItem = async (id) => {
+        if(!id || !db) return;
+        try {
+          await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'menu', id));
+        } catch (err) {
+          console.error("Failed to delete menu item:", err);
+        }
+      };
+
+      const executeErase = async () => {
+        if(!db || !eraseTarget) return;
+        setIsErasing(true);
+        try {
+          if (eraseTarget === 'orders' || eraseTarget === 'all') {
+            const promises = orders.map(order => 
+              deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'orders', order.id))
+            );
+            await Promise.all(promises);
+          }
+          if (eraseTarget === 'all') {
+            const promises = menuItems.map(item => 
+              deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'menu', item.id))
+            );
+            await Promise.all(promises);
+          }
+          setEraseTarget(null);
+        } catch (err) {
+          console.error("Failed to erase data:", err);
+        }
+        setIsErasing(false);
+      };
+
+      const formatWhatsAppNumber = (phoneStr) => {
+        if (!phoneStr) return '';
+        let cleaned = phoneStr.replace(/\D/g, ''); 
+        if (cleaned.startsWith('0')) {
+          cleaned = '60' + cleaned.slice(1); 
+        }
+        return cleaned;
+      };
+
+      const generateReceiptMessage = (order) => {
+        const orderId = order.id ? order.id.slice(0,6).toUpperCase() : 'N/A';
+        const dateStr = new Date(order.timestamp).toLocaleString();
+        const dining = order.diningOption === 'takeaway' ? 'TAKEOUT' : `TABLE ${order.tableNumber}`;
+        const payStatus = order.paymentStatus === 'paid' ? `PAID (${order.paymentMethod || 'Cash'})` : 'UNPAID';
+        
+        let msg = `🧾 *RECEIPT - KIOSK ORDER*\n`;
+        msg += `--------------------------------\n`;
+        msg += `Order ID: #${orderId}\n`;
+        msg += `Dining: ${dining}\n`;
+        msg += `Date: ${dateStr}\n`;
+        msg += `--------------------------------\n`;
+        order.items.forEach(item => {
+          msg += `${item.qty}x ${item.name} - ${formatRM(item.price * item.qty)}\n`;
+        });
+        msg += `--------------------------------\n`;
+        msg += `*TOTAL AMOUNT: ${formatRM(order.total)}*\n`;
+        msg += `Payment Status: *${payStatus}*\n`;
+        if (order.customerNote) {
+          msg += `Note: ${order.customerNote}\n`;
+        }
+        msg += `--------------------------------\n`;
+        msg += `Thank you for dining with us! Have a great day! 🙏`;
+        
+        return msg;
+      };
+
+      const sendReceiptToWhatsApp = async (order, explicitPhone = null) => {
+        const phone = explicitPhone || order.customerPhone;
+        if (!phone) {
+          setPromptWhatsAppOrder(order);
+          setCustomWhatsAppPhone('');
+          return;
+        }
+
+        const cleanedPhone = formatWhatsAppNumber(phone);
+        let textMessage = generateReceiptMessage(order);
+        
+        // Open window synchronously to avoid popup blocker on Desktop
+        let waWindow = null;
+        if (!navigator.canShare) { 
+            waWindow = window.open('', '_blank');
+            waWindow.document.write('<div style="font-family:sans-serif; padding: 20px;">Generating receipt image... please wait.</div>');
+        }
+
+        // Create temporary container for the receipt
+        const container = document.createElement('div');
+        container.style.position = 'absolute';
+        container.style.left = '-9999px';
+        container.style.top = '0';
+        container.style.width = '380px';
+        container.style.padding = '24px';
+        container.style.background = '#ffffff';
+        container.style.color = '#000000';
+        container.style.fontFamily = 'monospace';
+        container.style.fontSize = '14px';
+        container.style.boxSizing = 'border-box';
+        
+        // Build receipt HTML
+        let html = `
+          <div style="text-align: center; border-bottom: 2px dashed #cbd5e1; padding-bottom: 16px; margin-bottom: 16px;">
+            <h2 style="margin: 0; font-size: 24px; font-weight: 800; text-transform: uppercase; font-family: sans-serif;">KioskOrder Cafe</h2>
+            <p style="margin: 4px 0 0; color: #64748b; font-size: 12px;">Official Sales Receipt</p>
+            <div style="margin-top: 12px; font-size: 13px; color: #334155; text-align: left;">
+              <div>Order #${order.id ? order.id.slice(0,6).toUpperCase() : 'N/A'}</div>
+              <div>Date: ${new Date(order.timestamp).toLocaleString()}</div>
+              <div style="font-weight: 700; margin-top: 4px; color: #0f172a;">${order.diningOption === 'takeaway' ? 'Takeaway' : `Table ${order.tableNumber}`}</div>
+            </div>
+          </div>
+          <div style="border-bottom: 2px dashed #cbd5e1; padding-bottom: 16px; margin-bottom: 16px;">
+        `;
+        order.items.forEach(item => {
+          html += `
+            <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
+              <span style="flex: 1; padding-right: 10px;">${item.qty}x ${item.name}</span>
+              <span style="font-weight: 600;">${formatRM(item.price * item.qty)}</span>
+            </div>
+          `;
+        });
+        html += `
+          </div>
+          <div style="border-bottom: 2px dashed #cbd5e1; padding-bottom: 16px; margin-bottom: 16px; text-align: right;">
+            <div style="display: flex; justify-content: space-between; font-weight: 800; font-size: 18px; margin-bottom: 8px;">
+              <span>TOTAL:</span>
+              <span>${formatRM(order.total)}</span>
+            </div>
+            <div style="display: flex; justify-content: space-between; color: #475569; font-size: 13px;">
+              <span>Payment Status:</span>
+              <span style="font-weight: 700; text-transform: uppercase;">${order.paymentStatus === 'paid' ? `PAID (${order.paymentMethod || 'Cash'})` : 'UNPAID'}</span>
+            </div>
+          </div>
+          <div style="text-align: center; color: #64748b; font-size: 12px;">
+            <p style="margin: 0;">Thank you for dining with us!</p>
+            <p style="margin: 4px 0 0; font-size: 10px; color: #94a3b8;">Please keep this receipt for verification.</p>
+          </div>
+        `;
+        
+        container.innerHTML = html;
+        document.body.appendChild(container);
+        
+        try {
+          if (!window.html2canvas) {
+             throw new Error("html2canvas script is missing.");
+          }
+          
+          const canvas = await window.html2canvas(container, { scale: 2, backgroundColor: '#ffffff', logging: false });
+          canvas.toBlob(async (blob) => {
+            document.body.removeChild(container);
+            const file = new File([blob], `Receipt_${order.id ? order.id.slice(0,6) : 'Order'}.png`, { type: 'image/png' });
+            
+            // Try Mobile Native Share First (Attaches file seamlessly to WA app)
+            if (navigator.canShare && navigator.canShare({ files: [file] })) {
+                if (waWindow) waWindow.close(); 
+                try {
+                    await navigator.share({
+                        files: [file],
+                        title: 'Order Receipt',
+                        text: textMessage
+                    });
+                    return; 
+                } catch (e) {
+                    console.log("Share API cancelled or failed", e);
+                    return;
+                }
+            }
+
+            // Desktop Fallback: Copy to Clipboard and prompt to paste
+            let copied = false;
+            try {
+                const item = new window.ClipboardItem({ "image/png": blob });
+                await navigator.clipboard.write([item]);
+                copied = true;
+            } catch (e) {
+                console.log("Clipboard API failed", e);
+            }
+
+            if (copied) {
+                textMessage += "\n\n(Paste the receipt image here)";
+                
+                // Show floating custom toast for Cashier instruction
+                const toast = document.createElement('div');
+                toast.innerHTML = "✅ Receipt IMAGE copied to clipboard!<br>Please PASTE (Ctrl+V) in the WhatsApp chat.";
+                toast.style.cssText = "position:fixed;top:24px;left:50%;transform:translateX(-50%);background:#10b981;color:#fff;padding:16px 24px;border-radius:12px;z-index:999999;font-weight:bold;text-align:center;box-shadow:0 10px 15px -3px rgba(0,0,0,0.1); font-family: sans-serif;";
+                document.body.appendChild(toast);
+                setTimeout(() => { if (document.body.contains(toast)) toast.remove() }, 6000);
+            }
+
+            const waUrl = `https://wa.me/${cleanedPhone}?text=${encodeURIComponent(textMessage)}`;
+            if (waWindow) {
+                waWindow.location.href = waUrl;
+            } else {
+                window.open(waUrl, '_blank');
+            }
+          }, 'image/png');
+        } catch (err) {
+            console.error("Canvas rendering error:", err);
+            if (document.body.contains(container)) document.body.removeChild(container);
+            const waUrl = `https://wa.me/${cleanedPhone}?text=${encodeURIComponent(textMessage)}`;
+            if (waWindow) {
+                waWindow.location.href = waUrl;
+            } else {
+                window.open(waUrl, '_blank');
+            }
+        }
+      };
+
+      const myActiveOrders = orders.filter(o => o.customerUserId === user?.uid && o.status !== 'finished');
+      
+      const newlyReadyOrders = myActiveOrders.filter(o => o.status === 'ready');
+      const showReadyAlert = newlyReadyOrders.length > 0 && userRole === 'customer';
+
+      const activeOrders = orders.filter(o => o.status !== 'finished');
+      
+      const totalStorageKB = menuItems.reduce((acc, item) => acc + getBase64SizeInKB(item.image), 0);
+
+      const now = new Date();
+      const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+      const currentDay = now.getDay() || 7; 
+      const startOfWeek = new Date(now.getFullYear(), now.getMonth(), now.getDate() - currentDay + 1).getTime();
+      const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+
+      const dailyEarning = orders.reduce((sum, o) => o.timestamp >= startOfToday ? sum + o.total : sum, 0);
+      const weeklyEarning = orders.reduce((sum, o) => o.timestamp >= startOfWeek ? sum + o.total : sum, 0);
+      const monthlyEarning = orders.reduce((sum, o) => o.timestamp >= startOfMonth ? sum + o.total : sum, 0);
+
+      const filteredOrders = orders.filter(o => {
+        if (statsTimeframe === 'today') return o.timestamp >= startOfToday;
+        if (statsTimeframe === 'week') return o.timestamp >= startOfWeek;
+        if (statsTimeframe === 'month') return o.timestamp >= startOfMonth;
+        return true; 
+      });
+
+      const filteredTotalEarning = filteredOrders.reduce((sum, o) => sum + (o.total || 0), 0);
+
+      const itemSalesMap = {};
+      filteredOrders.forEach(order => {
+        if (Array.isArray(order.items)) {
+          order.items.forEach(item => {
+            const key = item.name || item.id;
+            if (!itemSalesMap[key]) {
+              itemSalesMap[key] = {
+                name: item.name,
+                category: item.category || 'General',
+                totalQty: 0,
+                totalRevenue: 0
+              };
+            }
+            itemSalesMap[key].totalQty += (item.qty || 0);
+            itemSalesMap[key].totalRevenue += ((item.price || 0) * (item.qty || 0));
+          });
+        }
+      });
+
+      const bestSellingItems = Object.values(itemSalesMap).sort((a, b) => b.totalQty - a.totalQty);
+      
+      if (loading) {
+          return (
+              <div className="min-h-screen flex items-center justify-center bg-gray-50">
+                  <Activity className="animate-spin text-orange-500 w-12 h-12" />
+              </div>
+          );
+      }
+      
+      if (appConfig?.isRestricted && userRole !== 'architect') {
+          return (
+              <div className="fixed inset-0 z-[9999] bg-slate-900 flex items-center justify-center p-4">
+                   <button onClick={() => setShowAdminLogin(true)} className="absolute top-6 right-6 p-4 bg-white/5 hover:bg-white/20 text-white/40 hover:text-white rounded-full backdrop-blur-md transition-all z-[10000] border border-white/10 hover:border-white/30 shadow-2xl flex items-center justify-center group" title="System Login">
+                       <Shield className="w-6 h-6 group-hover:scale-110 transition-transform" />
+                   </button>
+
+                   <div className="bg-white p-8 sm:p-12 rounded-3xl shadow-2xl max-w-lg w-full text-center">
+                      <AlertTriangle className="w-20 h-20 text-red-500 mx-auto mb-6 animate-pulse" />
+                      <h2 className="text-3xl font-bold text-slate-900 mb-4">Service Notice</h2>
+                      <div className="text-gray-700 text-lg whitespace-pre-wrap bg-red-50 p-4 rounded-xl border border-red-100">
+                          {appConfig.subMessage || "System is currently disabled. Please contact the administrator regarding the monthly subscription."}
+                      </div>
+                   </div>
+
+                   {showAdminLogin && (
+                      <div className="fixed inset-0 z-[10001] flex items-center justify-center bg-slate-900/90 backdrop-blur-md p-4">
+                        <div className="bg-white rounded-2xl shadow-2xl max-w-sm w-full p-6 relative">
+                          <button onClick={() => setShowAdminLogin(false)} className="absolute top-4 right-4 p-2 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-full">
+                            <X className="w-5 h-5"/>
+                          </button>
+                          <h3 className="text-xl font-bold text-slate-900 mb-4 flex items-center gap-2"><LogIn className="w-5 h-5"/> Staff Login</h3>
+                          <form onSubmit={handleAdminLogin}>
+                            <input 
+                              type="password" 
+                              placeholder="Enter Access PIN" 
+                              value={adminPin}
+                              onChange={(e) => setAdminPin(e.target.value)}
+                              className="w-full p-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-orange-500 outline-none text-center text-lg tracking-widest font-mono mb-4"
+                              autoFocus
+                            />
+                            <button type="submit" className="w-full py-3 bg-slate-900 text-white rounded-xl font-bold hover:bg-slate-800 transition-colors">Login</button>
+                          </form>
+                        </div>
+                      </div>
+                    )}
+              </div>
+          );
+      }
+
+      const renderKitchenCards = () => (
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
+          {activeOrders.length === 0 ? (
+            <div className="col-span-full py-12 text-center text-slate-500 bg-white rounded-xl shadow-sm border border-slate-200">
+              <CheckCircle className="w-12 h-12 mx-auto mb-3 text-green-400 opacity-50"/>
+              <p>All caught up! No active kitchen orders.</p>
+            </div>
+          ) : (
+            activeOrders.map(order => (
+              <div key={order.id} className={`bg-white rounded-xl shadow-sm overflow-hidden border-t-4 transition-all ${order.status === 'pending' ? 'border-orange-500' : order.status === 'cooking' ? 'border-blue-500' : 'border-green-500'}`}>
+                <div className="p-4 border-b border-gray-100 flex justify-between items-center bg-gray-50/50">
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-gray-500 font-medium">Order #{order.id.slice(0,6).toUpperCase()}</span>
+                      <span className={`px-2 py-0.5 rounded text-xs font-bold ${order.diningOption === 'takeaway' ? 'bg-purple-100 text-purple-700' : 'bg-blue-100 text-blue-700'}`}>
+                        {order.diningOption === 'takeaway' ? 'Takeaway' : `Table ${order.tableNumber}`}
+                      </span>
+                    </div>
+                    <div className="text-xs text-gray-400 mt-0.5">{new Date(order.timestamp).toLocaleTimeString()}</div>
+                  </div>
+                  <span className={`px-2 py-1 rounded text-xs font-bold uppercase ${order.status === 'pending' ? 'bg-orange-100 text-orange-700' : order.status === 'cooking' ? 'bg-blue-100 text-blue-700' : 'bg-green-100 text-green-700'}`}>
+                    {order.status}
+                  </span>
+                </div>
+                <div className="p-4">
+                  {order.customerPhone && (
+                    <div className="mb-2 text-xs flex items-center gap-1.5 text-emerald-700 bg-emerald-50 p-2 rounded-lg border border-emerald-200 font-medium">
+                      <MessageCircle className="w-4 h-4 text-emerald-600 flex-shrink-0" />
+                      <span>WhatsApp: {order.customerPhone}</span>
+                    </div>
+                  )}
+
+                  {order.customerNote && (
+                    <div className="mb-3 text-xs bg-amber-50 text-amber-800 p-2 rounded-lg border border-amber-200">
+                      <span className="font-semibold">Note:</span> {order.customerNote}
+                    </div>
+                  )}
+                  
+                  <div className="mb-3 font-semibold text-xs text-slate-400 uppercase tracking-wider">Ordered Items:</div>
+                  <ul className="space-y-3 mb-4">
+                    {order.items.map((item, idx) => (
+                      <li key={idx} className="flex justify-between text-sm">
+                        <span className="font-semibold text-slate-800"><span className="text-orange-500 font-bold mr-2">{item.qty}x</span> {item.name}</span>
+                        <span className="text-gray-500">{formatRM(item.price * item.qty)}</span>
+                      </li>
+                    ))}
+                  </ul>
+                  
+                  <div className="flex justify-between items-center pt-3 border-t border-gray-100 mb-4">
+                    <span className="text-gray-500 font-medium text-sm">Total</span>
+                    <span className="font-bold text-lg text-slate-800">{formatRM(order.total)}</span>
+                  </div>
+
+                  {order.status === 'pending' && (
+                    <button onClick={() => updateOrderStatus(order.id, 'cooking')} className="w-full py-2.5 bg-blue-500 hover:bg-blue-600 text-white rounded-lg font-medium transition-colors shadow-sm active:scale-[0.98]">
+                      Start Cooking
+                    </button>
+                  )}
+                  {order.status === 'cooking' && (
+                    <button onClick={() => updateOrderStatus(order.id, 'ready')} className="w-full py-2.5 bg-orange-500 hover:bg-orange-600 text-white rounded-lg font-medium transition-colors shadow-sm active:scale-[0.98]">
+                      Done Cooking (Ready to Serve)
+                    </button>
+                  )}
+                  {order.status === 'ready' && (
+                    <button onClick={() => updateOrderStatus(order.id, 'finished')} className="w-full py-2.5 bg-green-500 hover:bg-green-600 text-white rounded-lg font-medium transition-colors shadow-sm active:scale-[0.98]">
+                      Finish Order (Served)
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      );
+
+      const renderCashierPOS = () => {
+        const filteredCashierOrders = orders.filter(order => {
+          const searchLower = cashierSearch.toLowerCase();
+          const matchesSearch = !cashierSearch || 
+            (order.id && order.id.toLowerCase().includes(searchLower)) ||
+            (order.tableNumber && order.tableNumber.toString().toLowerCase().includes(searchLower)) ||
+            (order.customerPhone && order.customerPhone.toLowerCase().includes(searchLower));
+
+          if (!matchesSearch) return false;
+
+          if (cashierFilter === 'unpaid') return order.paymentStatus !== 'paid';
+          if (cashierFilter === 'paid') return order.paymentStatus === 'paid';
+          if (cashierFilter === 'active') return order.status !== 'finished';
+          if (cashierFilter === 'finished') return order.status === 'finished';
+
+          return true; 
+        });
+
+        return (
+          <div className="space-y-6 max-w-6xl mx-auto">
+            <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
+              <div>
+                <h3 className="text-2xl font-bold text-slate-800 flex items-center gap-2">
+                  <Receipt className="w-7 h-7 text-emerald-600"/> Cashier POS & Billing System
+                </h3>
+                <p className="text-xs text-gray-500 mt-1">
+                  Manage live order payments (In & Out), collect customer payment, print thermal receipts, or WhatsApp digital receipts directly.
+                </p>
+              </div>
+
+              <div className="relative w-full md:w-72">
+                <Search className="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                <input 
+                  type="text" 
+                  placeholder="Search Table, ID, WhatsApp..." 
+                  value={cashierSearch}
+                  onChange={(e) => setCashierSearch(e.target.value)}
+                  className="w-full pl-9 pr-4 py-2 border border-gray-300 rounded-xl text-sm focus:ring-2 focus:ring-emerald-500 outline-none"
+                />
+              </div>
+            </div>
+
+            <div className="flex flex-wrap gap-2 bg-gray-100 p-1.5 rounded-xl text-xs sm:text-sm font-semibold">
+              <button 
+                onClick={() => setCashierFilter('all')}
+                className={`px-4 py-2 rounded-lg transition-all ${cashierFilter === 'all' ? 'bg-white text-slate-900 shadow-sm' : 'text-gray-600 hover:text-slate-900'}`}
+              >
+                All Orders ({orders.length})
+              </button>
+              <button 
+                onClick={() => setCashierFilter('unpaid')}
+                className={`px-4 py-2 rounded-lg transition-all flex items-center gap-1.5 ${cashierFilter === 'unpaid' ? 'bg-amber-500 text-white shadow-sm' : 'text-amber-700 bg-amber-50 hover:bg-amber-100'}`}
+              >
+                ⚠️ Unpaid ({orders.filter(o => o.paymentStatus !== 'paid').length})
+              </button>
+              <button 
+                onClick={() => setCashierFilter('paid')}
+                className={`px-4 py-2 rounded-lg transition-all flex items-center gap-1.5 ${cashierFilter === 'paid' ? 'bg-emerald-600 text-white shadow-sm' : 'text-emerald-700 bg-emerald-50 hover:bg-emerald-100'}`}
+              >
+                ✓ Paid ({orders.filter(o => o.paymentStatus === 'paid').length})
+              </button>
+              <button 
+                onClick={() => setCashierFilter('active')}
+                className={`px-4 py-2 rounded-lg transition-all ${cashierFilter === 'active' ? 'bg-white text-slate-900 shadow-sm' : 'text-gray-600 hover:text-slate-900'}`}
+              >
+                Kitchen In ({activeOrders.length})
+              </button>
+              <button 
+                onClick={() => setCashierFilter('finished')}
+                className={`px-4 py-2 rounded-lg transition-all ${cashierFilter === 'finished' ? 'bg-white text-slate-900 shadow-sm' : 'text-gray-600 hover:text-slate-900'}`}
+              >
+                Out / Served ({orders.filter(o => o.status === 'finished').length})
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              {filteredCashierOrders.map(order => {
+                const isPaid = order.paymentStatus === 'paid';
+                return (
+                  <div key={order.id} className={`bg-white rounded-2xl border transition-all overflow-hidden shadow-sm hover:shadow-md ${isPaid ? 'border-emerald-200' : 'border-amber-300 ring-1 ring-amber-200'}`}>
+                    
+                    <div className={`p-4 flex justify-between items-start border-b ${isPaid ? 'bg-emerald-50/50 border-emerald-100' : 'bg-amber-50/60 border-amber-100'}`}>
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <span className="font-extrabold text-slate-900 text-lg">
+                            {order.diningOption === 'takeaway' ? '🛍️ Takeaway' : `🍽️ Table ${order.tableNumber}`}
+                          </span>
+                          <span className="text-xs text-gray-500 font-mono">#{order.id.slice(0,6).toUpperCase()}</span>
+                        </div>
+                        <div className="text-xs text-gray-500 mt-1 flex items-center gap-2">
+                          <span>{new Date(order.timestamp).toLocaleString()}</span>
+                          <span className="capitalize px-2 py-0.5 bg-gray-200/80 rounded text-[11px] font-semibold text-gray-700">Kitchen: {order.status}</span>
+                        </div>
+                      </div>
+
+                      <span className={`px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider flex items-center gap-1 ${isPaid ? 'bg-emerald-500 text-white' : 'bg-amber-500 text-white animate-pulse'}`}>
+                        {isPaid ? <Check className="w-3.5 h-3.5"/> : <AlertTriangle className="w-3.5 h-3.5"/>}
+                        {isPaid ? `PAID (${order.paymentMethod || 'Cash'})` : 'UNPAID'}
+                      </span>
+                    </div>
+
+                    <div className="p-4 space-y-4">
+                      <div className="flex items-center justify-between text-xs bg-slate-50 p-2.5 rounded-xl border border-gray-200">
+                        <span className="text-gray-500 font-medium">WhatsApp Customer:</span>
+                        {order.customerPhone ? (
+                          <span className="font-bold text-emerald-700 flex items-center gap-1">
+                            <MessageCircle className="w-3.5 h-3.5 fill-emerald-600 text-emerald-600" />
+                            {order.customerPhone}
+                          </span>
+                        ) : (
+                          <span className="text-gray-400 italic">Not provided</span>
+                        )}
+                      </div>
+
+                      <div className="space-y-1.5 max-h-40 overflow-y-auto pr-1">
+                        {order.items.map((item, idx) => (
+                          <div key={idx} className="flex justify-between text-xs sm:text-sm">
+                            <span className="text-slate-800 font-medium"><span className="text-orange-500 font-bold">{item.qty}x</span> {item.name}</span>
+                            <span className="text-gray-600 font-semibold">{formatRM(item.price * item.qty)}</span>
+                          </div>
+                        ))}
+                      </div>
+
+                      <div className="pt-3 border-t border-gray-100 flex justify-between items-center">
+                        <span className="text-xs font-bold text-gray-500 uppercase tracking-wider">Total Bill</span>
+                        <span className="text-xl font-black text-slate-900">{formatRM(order.total)}</span>
+                      </div>
+
+                      <div className="pt-2">
+                        <span className="text-[11px] font-bold text-gray-400 uppercase tracking-wider block mb-1.5">Collect Payment</span>
+                        <div className="grid grid-cols-3 gap-2">
+                          <button 
+                            onClick={() => updatePaymentStatus(order.id, 'paid', 'Cash')}
+                            className={`py-2 rounded-xl text-xs font-bold flex items-center justify-center gap-1 transition-all ${isPaid && order.paymentMethod === 'Cash' ? 'bg-emerald-600 text-white shadow' : 'bg-gray-100 text-gray-700 hover:bg-emerald-100 hover:text-emerald-800'}`}
+                          >
+                            <Banknote className="w-3.5 h-3.5" /> Cash
+                          </button>
+                          <button 
+                            onClick={() => updatePaymentStatus(order.id, 'paid', 'QR Pay')}
+                            className={`py-2 rounded-xl text-xs font-bold flex items-center justify-center gap-1 transition-all ${isPaid && order.paymentMethod === 'QR Pay' ? 'bg-emerald-600 text-white shadow' : 'bg-gray-100 text-gray-700 hover:bg-emerald-100 hover:text-emerald-800'}`}
+                          >
+                            <Code className="w-3.5 h-3.5" /> QR Pay
+                          </button>
+                          <button 
+                            onClick={() => updatePaymentStatus(order.id, 'paid', 'Card')}
+                            className={`py-2 rounded-xl text-xs font-bold flex items-center justify-center gap-1 transition-all ${isPaid && order.paymentMethod === 'Card' ? 'bg-emerald-600 text-white shadow' : 'bg-gray-100 text-gray-700 hover:bg-emerald-100 hover:text-emerald-800'}`}
+                          >
+                            <CreditCard className="w-3.5 h-3.5" /> Card
+                          </button>
+                        </div>
+                        {isPaid && (
+                          <button 
+                            onClick={() => updatePaymentStatus(order.id, 'unpaid', 'pending')}
+                            className="mt-2 w-full py-1 text-[11px] text-amber-700 hover:underline text-center block"
+                          >
+                            Mark back as Unpaid
+                          </button>
+                        )}
+                      </div>
+
+                      <div className="pt-2 border-t border-gray-100 flex gap-2">
+                        <button 
+                          onClick={() => setReceiptModalOrder(order)}
+                          className="flex-1 py-2.5 bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold rounded-xl flex items-center justify-center gap-1.5 transition-colors shadow-sm"
+                        >
+                          <Printer className="w-4 h-4"/> Print Receipt
+                        </button>
+                        <button 
+                          onClick={() => sendReceiptToWhatsApp(order)}
+                          className="flex-1 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold rounded-xl flex items-center justify-center gap-1.5 transition-colors shadow-sm"
+                        >
+                          <MessageCircle className="w-4 h-4"/> WhatsApp Receipt
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+
+              {filteredCashierOrders.length === 0 && (
+                <div className="col-span-full py-16 text-center text-gray-400 bg-white rounded-2xl border border-gray-200">
+                  <Receipt className="w-12 h-12 mx-auto mb-3 opacity-30" />
+                  <p className="font-semibold text-slate-700">No matching orders found.</p>
+                  <p className="text-xs text-gray-400 mt-1">Try clearing your search bar or selecting a different filter tab.</p>
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      };
+
+      const renderAdminDashboard = () => (
+        <div className="flex h-screen bg-gray-100 overflow-hidden text-sm sm:text-base">
+          <div className="w-64 bg-slate-900 text-white flex flex-col hidden sm:flex">
+            <div className="p-6">
+              <h2 className="text-2xl font-bold text-orange-400 flex items-center gap-2">
+                <Settings className="w-6 h-6"/> {userRole === 'architect' ? 'Architect' : userRole === 'admin' ? 'Admin' : userRole === 'cashier' ? 'Cashier' : 'Manager'}
+              </h2>
+            </div>
+            <nav className="flex-1 px-4 space-y-2">
+              <button onClick={() => setActiveTab('orders')} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${activeTab === 'orders' ? 'bg-orange-500 text-white' : 'text-slate-300 hover:bg-slate-800'}`}>
+                <Bell className="w-5 h-5"/> Kitchen Board
+                {activeOrders.length > 0 && <span className="ml-auto bg-red-500 text-white text-xs px-2 py-1 rounded-full">{activeOrders.length}</span>}
+              </button>
+
+              {(userRole === 'cashier' || userRole === 'admin' || userRole === 'manager' || userRole === 'architect') && (
+                <button onClick={() => setActiveTab('cashier')} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${activeTab === 'cashier' ? 'bg-emerald-600 text-white' : 'text-slate-300 hover:bg-slate-800'}`}>
+                  <Receipt className="w-5 h-5"/> Cashier POS
+                  {orders.filter(o => o.paymentStatus !== 'paid').length > 0 && (
+                    <span className="ml-auto bg-amber-500 text-white text-xs px-2 py-0.5 rounded-full font-bold">
+                      {orders.filter(o => o.paymentStatus !== 'paid').length}
+                    </span>
+                  )}
+                </button>
+              )}
+
+              <button onClick={() => setActiveTab('menu')} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${activeTab === 'menu' ? 'bg-orange-500 text-white' : 'text-slate-300 hover:bg-slate-800'}`}>
+                <UtensilsCrossed className="w-5 h-5"/> Manage Menu
+              </button>
+              {(userRole === 'admin' || userRole === 'architect' || userRole === 'manager') && (
+                <button onClick={() => setActiveTab('dashboard')} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${activeTab === 'dashboard' ? 'bg-orange-500 text-white' : 'text-slate-300 hover:bg-slate-800'}`}>
+                  <LayoutDashboard className="w-5 h-5"/> Data & Stats
+                </button>
+              )}
+              {userRole === 'architect' && (
+                <button onClick={() => setActiveTab('architect')} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${activeTab === 'architect' ? 'bg-orange-500 text-white' : 'text-slate-300 hover:bg-slate-800'}`}>
+                  <Shield className="w-5 h-5"/> Architect Tools
+                </button>
+              )}
+            </nav>
+            <div className="p-4 border-t border-slate-800">
+               <button onClick={handleAdminLogout} className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-slate-800 hover:bg-slate-700 rounded-lg transition-colors">
+                <LogOut className="w-4 h-4"/> Exit
+              </button>
+            </div>
+          </div>
+
+          <div className="sm:hidden fixed top-0 left-0 right-0 bg-slate-900 text-white z-50 p-4 flex justify-between items-center shadow-lg">
+            <h2 className="text-xl font-bold text-orange-400 capitalize">{userRole}</h2>
+            <div className="flex gap-2">
+               <button onClick={() => setActiveTab('orders')} className={`p-2 rounded ${activeTab === 'orders' ? 'bg-orange-500' : 'bg-slate-800'}`}><Bell className="w-5 h-5"/></button>
+               <button onClick={() => setActiveTab('cashier')} className={`p-2 rounded ${activeTab === 'cashier' ? 'bg-emerald-600' : 'bg-slate-800'}`}><Receipt className="w-5 h-5"/></button>
+               <button onClick={() => setActiveTab('menu')} className={`p-2 rounded ${activeTab === 'menu' ? 'bg-orange-500' : 'bg-slate-800'}`}><UtensilsCrossed className="w-5 h-5"/></button>
+               {(userRole === 'admin' || userRole === 'architect') && (
+                 <button onClick={() => setActiveTab('dashboard')} className={`p-2 rounded ${activeTab === 'dashboard' ? 'bg-orange-500' : 'bg-slate-800'}`}><LayoutDashboard className="w-5 h-5"/></button>
+               )}
+               {userRole === 'architect' && (
+                 <button onClick={() => setActiveTab('architect')} className={`p-2 rounded ${activeTab === 'architect' ? 'bg-orange-500' : 'bg-slate-800'}`}><Shield className="w-5 h-5"/></button>
+               )}
+               <button onClick={handleAdminLogout} className="p-2 rounded bg-red-500/20 text-red-400 ml-2"><LogOut className="w-5 h-5"/></button>
+            </div>
+          </div>
+
+          <div className="flex-1 overflow-y-auto p-4 sm:p-8 pt-20 sm:pt-8 pb-24 relative">
+            
+            {activeTab === 'orders' && (
+              <div className="space-y-6 max-w-5xl mx-auto">
+                <div className="flex justify-between items-center">
+                  <h3 className="text-2xl font-bold text-slate-800">Live Kitchen Board</h3>
+                  <span className="px-3 py-1 bg-blue-100 text-blue-800 rounded-full font-medium text-xs sm:text-sm">{activeOrders.length} Active Orders</span>
+                </div>
+                {renderKitchenCards()}
+              </div>
+            )}
+
+            {activeTab === 'cashier' && renderCashierPOS()}
+
+            {}
+            {activeTab === 'menu' && (
+              <div className="space-y-8 max-w-5xl mx-auto">
+                <div className="flex justify-between items-center">
+                  <h3 className="text-2xl font-bold text-slate-800">Menu Management</h3>
+                  {!editingItem && (
+                    <button onClick={() => setEditingItem({})} className="flex items-center gap-2 bg-orange-500 text-white px-4 py-2 rounded-lg hover:bg-orange-600 transition-colors shadow-sm">
+                      <Plus className="w-4 h-4"/> <span className="hidden sm:inline">Add Item</span>
+                    </button>
+                  )}
+                </div>
+
+                {editingItem && (
+                  <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
+                    <div className="flex justify-between items-center mb-6">
+                      <h4 className="text-lg font-bold text-slate-800">{editingItem.id ? 'Edit Item' : 'New Menu Item'}</h4>
+                      <button onClick={() => setEditingItem(null)} className="text-gray-400 hover:text-gray-600"><X className="w-5 h-5"/></button>
+                    </div>
+                    
+                    <form onSubmit={saveMenuItem} className="space-y-4">
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-1">Item Name</label>
+                          <input name="name" defaultValue={editingItem.name} required className="w-full p-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500 outline-none" />
+                        </div>
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-1">Category</label>
+                          <input name="category" defaultValue={editingItem.category} required placeholder="e.g., Mains, Drinks" className="w-full p-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500 outline-none" />
+                        </div>
+                        <div className="md:col-span-2">
+                          <label className="block text-sm font-medium text-gray-700 mb-1">Description</label>
+                          <textarea name="description" defaultValue={editingItem.description} className="w-full p-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500 outline-none" rows="2"></textarea>
+                        </div>
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-1">Price (RM)</label>
+                          <input name="price" type="number" step="0.01" min="0" defaultValue={editingItem.price} required className="w-full p-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500 outline-none" />
+                        </div>
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-1">Image Upload (Auto-compressed to KB)</label>
+                          <input name="imageFile" type="file" accept="image/*" className="w-full p-2 border border-gray-300 rounded-lg text-sm bg-gray-50" />
+                          {editingItem.image && <div className="mt-2 flex items-center gap-2 text-xs text-green-600"><CheckCircle className="w-4 h-4"/> Image attached</div>}
+                        </div>
+                        <div className="md:col-span-2 flex items-center gap-2 mt-2">
+                          <input type="checkbox" name="available" id="available" defaultChecked={editingItem.available !== false} className="w-4 h-4 text-orange-500 rounded border-gray-300 focus:ring-orange-500"/>
+                          <label htmlFor="available" className="text-sm text-gray-700 font-medium">Item is available for order</label>
+                        </div>
+                      </div>
+                      <div className="flex justify-end gap-3 pt-4 border-t mt-4">
+                        <button type="button" onClick={() => setEditingItem(null)} className="px-4 py-2 text-gray-600 bg-gray-100 hover:bg-gray-200 rounded-lg font-medium transition-colors">Cancel</button>
+                        <button type="submit" className="px-6 py-2 bg-slate-900 text-white rounded-lg font-medium hover:bg-slate-800 transition-colors shadow-sm">Save Item</button>
+                      </div>
+                    </form>
+                  </div>
+                )}
+
+                <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-x-auto">
+                  <table className="w-full text-left text-sm min-w-[600px]">
+                    <thead className="bg-gray-50 text-gray-600 font-medium border-b border-gray-200">
+                      <tr>
+                        <th className="p-4">Item</th>
+                        <th className="p-4">Category</th>
+                        <th className="p-4">Price</th>
+                        <th className="p-4 text-center">Status</th>
+                        <th className="p-4 text-right">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-100">
+                      {menuItems.map(item => (
+                        <tr key={item.id} className="hover:bg-gray-50/50 transition-colors">
+                          <td className="p-4 flex items-center gap-3">
+                            {item.image ? (
+                              <img src={item.image} alt={item.name} className="w-10 h-10 rounded-md object-cover border border-gray-200 flex-shrink-0" />
+                            ) : (
+                              <div className="w-10 h-10 rounded-md bg-gray-100 flex items-center justify-center text-gray-400 flex-shrink-0"><ImageIcon className="w-5 h-5"/></div>
+                            )}
+                            <div>
+                              <div className="font-semibold text-slate-800">{item.name}</div>
+                              <div className="text-xs text-gray-500 truncate max-w-[100px] sm:max-w-[150px]">{item.description}</div>
+                            </div>
+                          </td>
+                          <td className="p-4 text-gray-600">{item.category}</td>
+                          <td className="p-4 font-medium text-slate-800">{formatRM(item.price)}</td>
+                          <td className="p-4 text-center">
+                            <span className={`px-2 py-1 text-xs rounded-full font-medium ${item.available ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
+                              {item.available ? 'Available' : 'Hidden'}
+                            </span>
+                          </td>
+                          <td className="p-4 text-right space-x-2">
+                            <button onClick={() => setEditingItem(item)} className="p-2 text-blue-600 bg-blue-50 hover:bg-blue-100 hover:shadow-md rounded-lg transition-all inline-block" title="Edit Item"><Edit2 className="w-4 h-4"/></button>
+                            <button onClick={() => deleteMenuItem(item.id)} className="p-2 text-red-600 bg-red-50 hover:bg-red-100 hover:shadow-md rounded-lg transition-all inline-block" title="Delete Item"><Trash2 className="w-4 h-4"/></button>
+                          </td>
+                        </tr>
+                      ))}
+                      {menuItems.length === 0 && (
+                          <tr>
+                              <td colSpan="5" className="p-8 text-center text-gray-500">No items in the menu yet. Click "Add Item" to start.</td>
+                          </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {}
+            {activeTab === 'dashboard' && (
+              <div className="space-y-6 max-w-5xl mx-auto">
+                 <h3 className="text-2xl font-bold text-slate-800">Earnings Overview</h3>
+                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-6">
+                    <div className="bg-gradient-to-br from-green-500 to-green-600 p-6 rounded-xl shadow-md text-white flex flex-col justify-between">
+                      <div className="flex justify-between items-center mb-4">
+                        <div className="text-green-100 font-semibold">Today's Earnings</div>
+                        <TrendingUp className="w-6 h-6 text-green-100"/>
+                      </div>
+                      <div className="text-4xl font-extrabold">{formatRM(dailyEarning)}</div>
+                    </div>
+                    
+                    <div className="bg-gradient-to-br from-blue-500 to-blue-600 p-6 rounded-xl shadow-md text-white flex flex-col justify-between">
+                      <div className="flex justify-between items-center mb-4">
+                        <div className="text-blue-100 font-semibold">This Week</div>
+                        <CalendarDays className="w-6 h-6 text-blue-100"/>
+                      </div>
+                      <div className="text-4xl font-extrabold">{formatRM(weeklyEarning)}</div>
+                    </div>
+
+                    <div className="bg-gradient-to-br from-purple-500 to-purple-600 p-6 rounded-xl shadow-md text-white flex flex-col justify-between">
+                      <div className="flex justify-between items-center mb-4">
+                        <div className="text-purple-100 font-semibold">This Month</div>
+                        <DollarSign className="w-6 h-6 text-purple-100"/>
+                      </div>
+                      <div className="text-4xl font-extrabold">{formatRM(monthlyEarning)}</div>
+                    </div>
+                 </div>
+
+                 <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 mt-8 space-y-6">
+                   <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 border-b border-gray-100 pb-4">
+                     <div>
+                       <h3 className="text-xl font-bold text-slate-800 flex items-center gap-2">
+                         <Flame className="w-5 h-5 text-orange-500"/> Best Selling & Frequently Ordered Menu
+                       </h3>
+                       <p className="text-xs text-gray-500 mt-1">
+                         See which menu items customers are ordering the most based on day, week, month, or all-time.
+                       </p>
+                     </div>
+                     
+                     <div className="flex bg-gray-100 p-1 rounded-lg text-xs font-semibold self-stretch sm:self-auto">
+                       <button 
+                         onClick={() => setStatsTimeframe('today')}
+                         className={`flex-1 sm:flex-none px-3 py-1.5 rounded-md transition-all ${statsTimeframe === 'today' ? 'bg-white text-orange-600 shadow-sm' : 'text-gray-600 hover:text-slate-900'}`}
+                       >
+                         Today
+                       </button>
+                       <button 
+                         onClick={() => setStatsTimeframe('week')}
+                         className={`flex-1 sm:flex-none px-3 py-1.5 rounded-md transition-all ${statsTimeframe === 'week' ? 'bg-white text-orange-600 shadow-sm' : 'text-gray-600 hover:text-slate-900'}`}
+                       >
+                         This Week
+                       </button>
+                       <button 
+                         onClick={() => setStatsTimeframe('month')}
+                         className={`flex-1 sm:flex-none px-3 py-1.5 rounded-md transition-all ${statsTimeframe === 'month' ? 'bg-white text-orange-600 shadow-sm' : 'text-gray-600 hover:text-slate-900'}`}
+                       >
+                         This Month
+                       </button>
+                       <button 
+                         onClick={() => setStatsTimeframe('all')}
+                         className={`flex-1 sm:flex-none px-3 py-1.5 rounded-md transition-all ${statsTimeframe === 'all' ? 'bg-white text-orange-600 shadow-sm' : 'text-gray-600 hover:text-slate-900'}`}
+                       >
+                         All Time
+                       </button>
+                     </div>
+                   </div>
+
+                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 bg-orange-50/50 p-4 rounded-lg border border-orange-100">
+                     <div>
+                       <span className="text-xs font-medium text-orange-800 uppercase tracking-wider">Filtered Revenue ({statsTimeframe})</span>
+                       <div className="text-2xl font-black text-slate-900 mt-0.5">{formatRM(filteredTotalEarning)}</div>
+                     </div>
+                     <div>
+                       <span className="text-xs font-medium text-orange-800 uppercase tracking-wider">Total Orders Count</span>
+                       <div className="text-2xl font-black text-slate-900 mt-0.5">{filteredOrders.length} orders</div>
+                     </div>
+                   </div>
+
+                   <div className="overflow-x-auto">
+                     <table className="w-full text-left text-sm min-w-[500px]">
+                       <thead className="bg-gray-50 text-gray-500 font-medium text-xs uppercase border-b border-gray-200">
+                         <tr>
+                           <th className="p-3">Rank</th>
+                           <th className="p-3">Menu Item</th>
+                           <th className="p-3">Category</th>
+                           <th className="p-3 text-center">Total Quantity Sold</th>
+                           <th className="p-3 text-right">Revenue Generated</th>
+                         </tr>
+                       </thead>
+                       <tbody className="divide-y divide-gray-100">
+                         {bestSellingItems.map((item, idx) => (
+                           <tr key={idx} className="hover:bg-gray-50/80 transition-colors">
+                             <td className="p-3 font-bold">
+                               {idx === 0 ? (
+                                 <span className="inline-flex items-center gap-1 bg-amber-100 text-amber-800 px-2 py-0.5 rounded-full text-xs"><Award className="w-3.5 h-3.5 text-amber-600"/> #1 Top</span>
+                               ) : idx === 1 ? (
+                                 <span className="inline-flex items-center gap-1 bg-slate-100 text-slate-700 px-2 py-0.5 rounded-full text-xs">#2</span>
+                               ) : idx === 2 ? (
+                                 <span className="inline-flex items-center gap-1 bg-amber-900/10 text-amber-900 px-2 py-0.5 rounded-full text-xs">#3</span>
+                               ) : (
+                                 <span className="text-gray-400 pl-2">#{idx + 1}</span>
+                               )}
+                             </td>
+                             <td className="p-3 font-semibold text-slate-800">{item.name}</td>
+                             <td className="p-3 text-gray-500 text-xs">{item.category}</td>
+                             <td className="p-3 text-center font-extrabold text-orange-600">
+                               <span className="bg-orange-100 text-orange-800 px-2.5 py-1 rounded-full">{item.totalQty} sold</span>
+                             </td>
+                             <td className="p-3 text-right font-bold text-slate-800">{formatRM(item.totalRevenue)}</td>
+                           </tr>
+                         ))}
+                         {bestSellingItems.length === 0 && (
+                           <tr>
+                             <td colSpan="5" className="p-8 text-center text-gray-400">
+                               No order records found for this selected timeframe.
+                             </td>
+                           </tr>
+                         )}
+                       </tbody>
+                     </table>
+                   </div>
+                 </div>
+
+                 <h3 className="text-2xl font-bold text-slate-800 mt-10">System Stats</h3>
+                 <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-6">
+                    <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 flex items-center gap-4">
+                      <div className="p-4 bg-orange-100 text-orange-600 rounded-full"><LayoutDashboard className="w-8 h-8"/></div>
+                      <div>
+                        <div className="text-sm text-gray-500 font-medium">Total Menu Items</div>
+                        <div className="text-3xl font-bold text-slate-800">{menuItems.length}</div>
+                      </div>
+                    </div>
+                    <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 flex items-center gap-4">
+                      <div className="p-4 bg-blue-100 text-blue-600 rounded-full"><Activity className="w-8 h-8"/></div>
+                      <div>
+                        <div className="text-sm text-gray-500 font-medium">All-Time Orders</div>
+                        <div className="text-3xl font-bold text-slate-800">{orders.length}</div>
+                      </div>
+                    </div>
+                    <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 flex items-center gap-4">
+                      <div className="p-4 bg-indigo-100 text-indigo-600 rounded-full"><Info className="w-8 h-8"/></div>
+                      <div>
+                        <div className="text-sm text-gray-500 font-medium">Est. Storage Used</div>
+                        <div className="text-3xl font-bold text-slate-800">
+                          {totalStorageKB > 1024 ? (totalStorageKB / 1024).toFixed(2) + ' MB' : totalStorageKB.toFixed(1) + ' KB'}
+                        </div>
+                      </div>
+                    </div>
+                 </div>
+
+                 <div className="bg-red-50 p-6 rounded-xl border border-red-200 mt-10">
+                   <div className="flex items-center gap-3 mb-4">
+                     <AlertTriangle className="w-8 h-8 text-red-600" />
+                     <h4 className="text-xl font-bold text-red-800">Danger Zone</h4>
+                   </div>
+                   <p className="text-red-700 text-sm mb-6">
+                     These actions will permanently delete data from your Firebase Storage to make space. This cannot be undone. 
+                   </p>
+                   <div className="flex flex-col sm:flex-row gap-4">
+                     <button onClick={() => setEraseTarget('orders')} className="py-3 px-6 bg-red-100 text-red-700 font-bold rounded-lg hover:bg-red-200 transition-colors border border-red-300 flex-1">
+                       Clear All Order History
+                     </button>
+                     <button onClick={() => setEraseTarget('all')} className="py-3 px-6 bg-red-600 text-white font-bold rounded-lg hover:bg-red-700 transition-colors shadow flex-1">
+                       Factory Reset (Erase Everything)
+                     </button>
+                   </div>
+                 </div>
+              </div>
+            )}
+            
+            {}
+            {activeTab === 'architect' && (
+              <div className="space-y-6 max-w-5xl mx-auto">
+                 <h3 className="text-2xl font-bold text-slate-800">Architect Master Controls</h3>
+
+                 <div className="bg-white p-6 sm:p-8 rounded-xl shadow-sm border border-red-200 relative overflow-hidden">
+                    <div className="absolute top-0 right-0 p-4 opacity-5 pointer-events-none"><Shield className="w-32 h-32 text-red-900"/></div>
+                    <h4 className="text-xl font-bold text-slate-900 mb-4 flex items-center gap-2 relative z-10">
+                        <AlertTriangle className="w-6 h-6 text-red-500"/> App Kill Switch (Restrict Access)
+                    </h4>
+                    <p className="text-gray-600 text-sm mb-8 max-w-2xl relative z-10">
+                        Activating this switch will completely lock down the application for all Customers, Waiters, Cashiers, and Managers. The system will display the subscription reminder notification defined below. Only the Architect can bypass this screen to re-enable the app.
+                    </p>
+                    <button
+                        onClick={() => updateAppConfig({ isRestricted: !appConfig?.isRestricted })}
+                        className={`px-6 py-4 rounded-xl font-bold text-white shadow-md transition-all w-full sm:w-auto text-lg ${appConfig?.isRestricted ? 'bg-green-500 hover:bg-green-600 shadow-green-500/30' : 'bg-red-600 hover:bg-red-700 shadow-red-600/30'}`}
+                    >
+                        {appConfig?.isRestricted ? '🟢 Unlock & Enable Application' : '🔴 Restrict & Disable Application'}
+                    </button>
+                 </div>
+
+                 <div className="bg-white p-6 sm:p-8 rounded-xl shadow-sm border border-gray-200 mt-6">
+                     <h4 className="text-lg font-bold text-slate-900 mb-2">Subscription Reminder Notification</h4>
+                     <p className="text-gray-600 text-sm mb-6">This message will be displayed prominently across the entire screen when the app is restricted.</p>
+
+                     <textarea
+                        value={architectMessageInput}
+                        onChange={(e) => setArchitectMessageInput(e.target.value)}
+                        rows="5"
+                        className="w-full p-4 border border-gray-300 rounded-xl focus:ring-2 focus:ring-slate-900 outline-none mb-4 text-gray-800"
+                        placeholder="Enter the payment reminder message here..."
+                     ></textarea>
+
+                     <button
+                        onClick={() => updateAppConfig({ subMessage: architectMessageInput })}
+                        className="px-6 py-3 bg-slate-900 hover:bg-slate-800 text-white font-bold rounded-xl shadow-sm transition-colors"
+                     >
+                        Save Notification Message
+                     </button>
+                 </div>
+
+                 <div className="bg-white p-6 sm:p-8 rounded-xl shadow-sm border border-gray-200 mt-6">
+                    <h4 className="text-lg font-bold text-slate-900 mb-4 flex items-center gap-2">
+                        <Lock className="w-5 h-5 text-slate-700"/> Role Access Control (PINs)
+                    </h4>
+                    <p className="text-gray-600 text-sm mb-6">Modify the PINs required to access different staff roles. <strong>Warning:</strong> The fallback Architect PIN (7777) will always work to prevent absolute lockout.</p>
+                    
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-6">
+                        <div>
+                            <label className="block text-sm font-semibold text-gray-700 mb-1">Architect PIN</label>
+                            <input type="text" value={pinConfig.architect} onChange={e => setPinConfig({...pinConfig, architect: e.target.value})} className="w-full p-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-slate-900 outline-none font-mono text-lg" />
+                        </div>
+                        <div>
+                            <label className="block text-sm font-semibold text-gray-700 mb-1">Main Admin PIN</label>
+                            <input type="text" value={pinConfig.admin} onChange={e => setPinConfig({...pinConfig, admin: e.target.value})} className="w-full p-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-slate-900 outline-none font-mono text-lg" />
+                        </div>
+                        <div>
+                            <label className="block text-sm font-semibold text-gray-700 mb-1">Manager PIN</label>
+                            <input type="text" value={pinConfig.manager} onChange={e => setPinConfig({...pinConfig, manager: e.target.value})} className="w-full p-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-slate-900 outline-none font-mono text-lg" />
+                        </div>
+                        <div>
+                            <label className="block text-sm font-semibold text-gray-700 mb-1">Admin Cashier PIN</label>
+                            <input type="text" value={pinConfig.cashier || '1111'} onChange={e => setPinConfig({...pinConfig, cashier: e.target.value})} className="w-full p-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-emerald-600 outline-none font-mono text-lg" />
+                        </div>
+                        <div className="sm:col-span-2">
+                            <label className="block text-sm font-semibold text-gray-700 mb-1">Waiter PIN</label>
+                            <input type="text" value={pinConfig.waiter} onChange={e => setPinConfig({...pinConfig, waiter: e.target.value})} className="w-full p-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-slate-900 outline-none font-mono text-lg" />
+                        </div>
+                    </div>
+                    
+                    <button
+                        onClick={() => {
+                            updateAppConfig({ pins: pinConfig });
+                            setCopiedAction('pins');
+                            setTimeout(() => setCopiedAction(false), 2000);
+                        }}
+                        className="px-6 py-3 bg-slate-900 hover:bg-slate-800 text-white font-bold rounded-xl shadow-sm transition-colors flex items-center gap-2"
+                    >
+                        {copiedAction === 'pins' ? <><CheckCircle className="w-5 h-5"/> PINs Saved Successfully</> : 'Update Staff PINs'}
+                    </button>
+                 </div>
+
+                 <div className="bg-white p-6 sm:p-8 rounded-xl shadow-sm border border-gray-200 mt-6">
+                    <h4 className="text-lg font-bold text-slate-900 mb-2 flex items-center gap-2">
+                        <Code className="w-5 h-5 text-slate-700"/> Source Code & Firebase Injection
+                    </h4>
+                    <p className="text-gray-600 text-sm mb-4">
+                        To distribute this exact application to a different cafe owner, you must connect it to their unique Firebase storage. Paste their Firebase configuration JSON below to generate a replacement snippet.
+                    </p>
+                    
+                    <textarea
+                        value={newFirebaseConfig}
+                        onChange={(e) => setNewFirebaseConfig(e.target.value)}
+                        rows="8"
+                        className="w-full p-4 border border-gray-300 rounded-xl font-mono text-sm bg-slate-50 mb-4 outline-none focus:ring-2 focus:ring-orange-500 shadow-inner"
+                        spellCheck="false"
+                    ></textarea>
+                    
+                    <button
+                        onClick={() => {
+                            const snippet = `    firebaseConfig = typeof window.__firebase_config !== 'undefined' \n        ? JSON.parse(window.__firebase_config) \n        : ${newFirebaseConfig};`;
+                            try {
+                                navigator.clipboard.writeText(snippet);
+                            } catch(e) {}
+                            setCopiedAction('firebase');
+                            setTimeout(() => setCopiedAction(false), 2000);
+                        }}
+                        className="px-6 py-3 bg-orange-500 hover:bg-orange-600 text-white font-bold rounded-xl shadow-sm transition-colors flex items-center gap-2"
+                    >
+                        {copiedAction === 'firebase' ? <><CheckCircle className="w-5 h-5"/> Snippet Copied to Clipboard!</> : <><Copy className="w-5 h-5"/> Generate & Copy Source Code Snippet</>}
+                    </button>
+                 </div>
+              </div>
+            )}
+
+            {}
+            {eraseTarget && (
+              <div className="fixed inset-0 z-[200] flex items-center justify-center bg-slate-900/70 backdrop-blur-sm p-4">
+                 <div className="bg-white p-8 rounded-2xl shadow-2xl max-w-sm w-full text-center">
+                    <AlertTriangle className="w-16 h-16 text-red-500 mx-auto mb-4" />
+                    <h2 className="text-2xl font-bold text-slate-900 mb-2">Are you sure?</h2>
+                    <p className="text-gray-600 mb-8">
+                      {eraseTarget === 'orders' ? "You are about to delete ALL order history. This action cannot be reversed." : "You are about to delete ALL orders and ALL menu items. Your app will be completely empty."}
+                    </p>
+                    <div className="flex gap-3">
+                      <button onClick={() => setEraseTarget(null)} disabled={isErasing} className="flex-1 py-3 bg-gray-100 text-gray-700 font-bold rounded-xl hover:bg-gray-200 disabled:opacity-50 transition-colors">
+                        Cancel
+                      </button>
+                      <button onClick={executeErase} disabled={isErasing} className="flex-1 py-3 bg-red-600 text-white font-bold rounded-xl hover:bg-red-700 disabled:opacity-50 transition-colors flex items-center justify-center gap-2">
+                        {isErasing ? <Activity className="w-5 h-5 animate-spin" /> : "Yes, Delete It"}
+                      </button>
+                    </div>
+                 </div>
+              </div>
+            )}
+
+            {receiptModalOrder && (
+              <div className="fixed inset-0 z-[250] flex items-center justify-center bg-slate-900/70 backdrop-blur-sm p-4 overflow-y-auto">
+                <div className="bg-white rounded-2xl shadow-2xl max-w-md w-full p-6 relative">
+                  <button 
+                    onClick={() => setReceiptModalOrder(null)} 
+                    className="absolute top-4 right-4 p-2 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-full"
+                  >
+                    <X className="w-5 h-5"/>
+                  </button>
+
+                  <div id="printable-receipt" className="font-mono text-slate-900 text-sm space-y-4 p-2">
+                    <div className="text-center border-b border-dashed border-gray-300 pb-4">
+                      <h2 className="text-xl font-bold tracking-tight uppercase">KioskOrder Cafe</h2>
+                      <p className="text-xs text-gray-500 mt-1">Official Sales Receipt</p>
+                      <div className="text-xs text-gray-500 mt-2">
+                        <div>Order #{receiptModalOrder.id.slice(0,6).toUpperCase()}</div>
+                        <div>Date: {new Date(receiptModalOrder.timestamp).toLocaleString()}</div>
+                        <div className="font-bold text-slate-800 mt-0.5">
+                          {receiptModalOrder.diningOption === 'takeaway' ? 'Takeaway' : `Table ${receiptModalOrder.tableNumber}`}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="space-y-2 border-b border-dashed border-gray-300 pb-4">
+                      {receiptModalOrder.items.map((item, idx) => (
+                        <div key={idx} className="flex justify-between text-xs">
+                          <span>{item.qty}x {item.name}</span>
+                          <span className="font-semibold">{formatRM(item.price * item.qty)}</span>
+                        </div>
+                      ))}
+                    </div>
+
+                    <div className="space-y-1 text-right text-xs border-b border-dashed border-gray-300 pb-4">
+                      <div className="flex justify-between font-bold text-sm">
+                        <span>TOTAL:</span>
+                        <span>{formatRM(receiptModalOrder.total)}</span>
+                      </div>
+                      <div className="flex justify-between text-gray-600">
+                        <span>Payment Status:</span>
+                        <span className="uppercase font-bold">
+                          {receiptModalOrder.paymentStatus === 'paid' ? `PAID (${receiptModalOrder.paymentMethod || 'Cash'})` : 'UNPAID'}
+                        </span>
+                      </div>
+                      {receiptModalOrder.customerPhone && (
+                        <div className="flex justify-between text-gray-600">
+                          <span>WhatsApp:</span>
+                          <span>{receiptModalOrder.customerPhone}</span>
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="text-center text-xs text-gray-500 pt-2">
+                      <p>Thank you for dining with us!</p>
+                      <p className="text-[10px] text-gray-400 mt-1">Please keep this receipt for verification.</p>
+                    </div>
+                  </div>
+
+                  <div className="mt-6 flex gap-3">
+                    <button 
+                      onClick={() => setReceiptModalOrder(null)} 
+                      className="flex-1 py-3 bg-gray-100 hover:bg-gray-200 text-gray-700 font-bold rounded-xl transition-colors text-xs sm:text-sm"
+                    >
+                      Close
+                    </button>
+                    <button 
+                      onClick={() => window.print()} 
+                      className="flex-1 py-3 bg-slate-900 hover:bg-slate-800 text-white font-bold rounded-xl transition-colors shadow flex items-center justify-center gap-2 text-xs sm:text-sm"
+                    >
+                      <Printer className="w-4 h-4" /> Print via Printer
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {promptWhatsAppOrder && (
+              <div className="fixed inset-0 z-[250] flex items-center justify-center bg-slate-900/70 backdrop-blur-sm p-4">
+                <div className="bg-white rounded-2xl shadow-2xl max-w-sm w-full p-6 relative">
+                  <button 
+                    onClick={() => setPromptWhatsAppOrder(null)} 
+                    className="absolute top-4 right-4 p-2 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-full"
+                  >
+                    <X className="w-5 h-5"/>
+                  </button>
+
+                  <div className="flex items-center gap-2 text-emerald-600 mb-2">
+                    <MessageCircle className="w-6 h-6" />
+                    <h3 className="text-xl font-bold text-slate-900">Send WhatsApp Receipt</h3>
+                  </div>
+                  <p className="text-xs text-gray-500 mb-4">
+                    The customer did not key in a WhatsApp number during checkout. Enter their WhatsApp phone number below to send the receipt.
+                  </p>
+
+                  <form onSubmit={(e) => {
+                    e.preventDefault();
+                    if(!customWhatsAppPhone) return;
+                    sendReceiptToWhatsApp(promptWhatsAppOrder, customWhatsAppPhone);
+                    setPromptWhatsAppOrder(null);
+                  }}>
+                    <div className="mb-4">
+                      <label className="block text-xs font-semibold text-gray-700 mb-1">WhatsApp Phone Number</label>
+                      <div className="relative">
+                        <Phone className="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                        <input 
+                          type="tel"
+                          placeholder="e.g. 0123456789 or 60123456789" 
+                          value={customWhatsAppPhone}
+                          onChange={(e) => setCustomWhatsAppPhone(e.target.value)}
+                          className="w-full pl-9 p-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-emerald-500 outline-none text-sm font-medium"
+                          autoFocus
+                          required
+                        />
+                      </div>
+                    </div>
+
+                    <div className="flex gap-2">
+                      <button 
+                        type="button" 
+                        onClick={() => setPromptWhatsAppOrder(null)} 
+                        className="flex-1 py-3 bg-gray-100 hover:bg-gray-200 text-gray-700 font-bold rounded-xl text-xs sm:text-sm"
+                      >
+                        Cancel
+                      </button>
+                      <button 
+                        type="submit" 
+                        className="flex-1 py-3 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-xl text-xs sm:text-sm shadow flex items-center justify-center gap-1.5"
+                      >
+                        <MessageCircle className="w-4 h-4" /> Send Receipt
+                      </button>
+                    </div>
+                  </form>
+                </div>
+              </div>
+            )}
+
+          </div>
+        </div>
+      );
+
+      const renderCustomerView = () => (
+        <div className="min-h-screen bg-gray-50 font-sans pb-28">
+          <header className="bg-white sticky top-0 z-30 shadow-sm">
+            <div className="max-w-6xl mx-auto px-4 h-16 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <div className="w-8 h-8 bg-orange-500 rounded-lg flex items-center justify-center text-white font-bold"><UtensilsCrossed className="w-5 h-5"/></div>
+                <h1 className="text-xl font-bold text-slate-900 tracking-tight">KioskOrder</h1>
+              </div>
+              
+              <div className="flex items-center gap-4">
+                {userRole === 'waiter' ? (
+                  <>
+                    <button onClick={() => setIsWaiterBoardOpen(true)} className="flex items-center gap-1.5 text-sm font-bold bg-blue-100 text-blue-700 px-3 py-1.5 rounded-full hover:bg-blue-200 transition-colors shadow-sm">
+                      <ClipboardList className="w-4 h-4"/> 
+                      <span className="hidden sm:inline">Live Kitchen Board</span>
+                      {activeOrders.length > 0 && (
+                        <span className="bg-red-500 text-white text-[10px] w-5 h-5 flex items-center justify-center rounded-full font-bold">
+                          {activeOrders.length}
+                        </span>
+                      )}
+                    </button>
+                    <button onClick={handleAdminLogout} className="text-xs text-red-500 hover:text-red-700 flex items-center gap-1 transition-colors">
+                      <LogOut className="w-4 h-4 sm:w-3 sm:h-3"/> <span className="hidden sm:inline">Exit</span>
+                    </button>
+                  </>
+                ) : (
+                  <button onClick={() => setShowAdminLogin(true)} className="text-xs text-gray-400 hover:text-gray-600 flex items-center gap-1 transition-colors">
+                    <LogIn className="w-3 h-3"/> <span className="hidden sm:inline">Staff Login</span>
+                  </button>
+                )}
+                
+                <button 
+                  onClick={() => setIsCartOpen(true)}
+                  className="relative p-2 text-slate-700 bg-gray-100 hover:bg-gray-200 rounded-full transition-colors"
+                >
+                  <ShoppingCart className="w-6 h-6"/>
+                  {cart.length > 0 && (
+                    <span className="absolute -top-1 -right-1 bg-orange-500 text-white text-xs w-5 h-5 flex items-center justify-center rounded-full font-bold border-2 border-white">
+                      {cart.reduce((sum, i) => sum + i.qty, 0)}
+                    </span>
+                  )}
+                </button>
+              </div>
+            </div>
+          </header>
+
+          <main className="max-w-6xl mx-auto px-4 py-8">
+            {userRole === 'waiter' && activeOrders.length > 0 && (
+              <div className="mb-8 space-y-4 bg-white p-6 rounded-2xl border border-gray-200 shadow-sm">
+                <div className="flex justify-between items-center mb-2">
+                  <h2 className="text-xl font-bold text-slate-800 flex items-center gap-2">
+                    <Bell className="w-5 h-5 text-orange-500"/> Live Kitchen Board (Waiter Tracking)
+                  </h2>
+                  <span className="text-xs font-bold bg-orange-100 text-orange-800 px-3 py-1 rounded-full">
+                    {activeOrders.length} active orders
+                  </span>
+                </div>
+                <p className="text-xs text-gray-500 mb-4">Monitor incoming orders and exact item details requested by customers in real-time.</p>
+                {renderKitchenCards()}
+              </div>
+            )}
+
+            {menuItems.filter(i => i.available).length === 0 ? (
+              <div className="text-center py-20 text-gray-500 flex flex-col items-center">
+                  <UtensilsCrossed className="w-16 h-16 opacity-20 mb-4" />
+                  <p>No menu items available currently.</p>
+              </div>
+            ) : (
+              <div className="space-y-12 sm:space-y-16">
+                {[...new Set(menuItems.filter(i => i.available).map(i => i.category || 'Other'))].map(category => (
+                  <div key={category} className="animate-in fade-in slide-in-from-bottom-4 duration-700">
+                    <div className="flex items-center gap-4 mb-4 sm:mb-8">
+                      <h2 className="text-2xl sm:text-3xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-slate-900 to-slate-600 capitalize">
+                        {category}
+                      </h2>
+                      <div className="flex-1 h-px bg-gradient-to-r from-gray-200 to-transparent"></div>
+                    </div>
+                    
+                    <div className="block sm:hidden space-y-3">
+                      {menuItems.filter(i => i.available && (i.category || 'Other') === category).map((item) => {
+                        const isExpanded = !!expandedMobileItems[item.id];
+                        return (
+                          <div key={item.id} className="bg-white rounded-2xl border border-gray-200/80 shadow-sm overflow-hidden transition-all duration-200">
+                            <div 
+                              onClick={() => toggleMobileExpand(item.id)}
+                              className="p-4 flex items-center justify-between cursor-pointer select-none bg-white hover:bg-gray-50/80 active:bg-gray-100 transition-colors"
+                            >
+                              <div className="flex-1 pr-3">
+                                <div className="flex items-center gap-2">
+                                  <h3 className="font-bold text-slate-900 text-base leading-snug">{item.name}</h3>
+                                  {item.category && item.category.toLowerCase().includes('special') && (
+                                    <span className="bg-orange-100 text-orange-700 text-[10px] font-bold px-2 py-0.5 rounded-full">Must Try</span>
+                                  )}
+                                </div>
+                              </div>
+                              
+                              <div className="flex items-center gap-3 flex-shrink-0">
+                                <span className="font-extrabold text-slate-900 text-base bg-orange-50 text-orange-700 px-3 py-1 rounded-xl border border-orange-100">
+                                  {formatRM(item.price)}
+                                </span>
+                                <div className="p-1 text-gray-400">
+                                  {isExpanded ? <ChevronUp className="w-5 h-5 text-orange-500" /> : <ChevronDown className="w-5 h-5" />}
+                                </div>
+                              </div>
+                            </div>
+
+                            {isExpanded && (
+                              <div className="p-4 border-t border-gray-100 bg-slate-50/60 space-y-4 animate-in slide-in-from-top-2 duration-200">
+                                <div className="relative h-48 rounded-xl overflow-hidden bg-gray-100 border border-gray-200 shadow-inner">
+                                  {item.image ? (
+                                    <img src={item.image} alt={item.name} className="w-full h-full object-cover" />
+                                  ) : (
+                                    <div className="w-full h-full flex items-center justify-center text-gray-300">
+                                      <ImageIcon className="w-12 h-12 opacity-40" />
+                                    </div>
+                                  )}
+                                  <div className="absolute top-3 right-3 bg-slate-900/80 backdrop-blur-md text-white text-xs font-extrabold px-3 py-1.5 rounded-lg shadow-md">
+                                    {formatRM(item.price)}
+                                  </div>
+                                </div>
+
+                                {item.description && (
+                                  <p className="text-xs text-gray-600 leading-relaxed bg-white p-3 rounded-xl border border-gray-100">
+                                    {item.description}
+                                  </p>
+                                )}
+
+                                <button 
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    addToCart(item);
+                                  }}
+                                  className="w-full py-3.5 bg-orange-500 hover:bg-orange-600 active:bg-orange-700 text-white rounded-xl font-bold text-sm shadow-md shadow-orange-500/20 flex items-center justify-center gap-2 active:scale-98 transition-all"
+                                >
+                                  <Plus className="w-4 h-4" /> Add to Order • {formatRM(item.price)}
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    <div className="hidden sm:grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6 sm:gap-8">
+                      {menuItems.filter(i => i.available && (i.category || 'Other') === category).map((item) => (
+                        <div key={item.id} className="bg-white rounded-[2rem] shadow-sm hover:shadow-2xl border border-gray-100/50 overflow-hidden hover:-translate-y-1 sm:hover:-translate-y-2 transition-all duration-300 group flex flex-col relative">
+                          
+                          {item.category && item.category.toLowerCase().includes('special') && (
+                            <div className="absolute top-0 left-0 bg-gradient-to-r from-amber-400 to-orange-500 text-white text-[10px] font-bold px-4 py-1.5 rounded-br-2xl z-10 shadow-md uppercase tracking-widest">
+                              Must Try
+                            </div>
+                          )}
+
+                          <div className="h-48 sm:h-56 bg-gray-50 relative overflow-hidden">
+                            {item.image ? (
+                              <img src={item.image} alt={item.name} className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-700 ease-out" />
+                            ) : (
+                              <div className="w-full h-full flex items-center justify-center text-gray-300 bg-gradient-to-br from-gray-50 to-gray-200"><ImageIcon className="w-12 h-12 opacity-40"/></div>
+                            )}
+                            
+                            <div className="absolute top-4 right-4 bg-white/80 backdrop-blur-md px-3 py-1.5 sm:px-4 sm:py-1.5 rounded-2xl text-sm font-extrabold text-slate-900 shadow-[0_4px_12px_rgba(0,0,0,0.1)] border border-white/60">
+                              {formatRM(item.price)}
+                            </div>
+                          </div>
+
+                          <div className="p-5 sm:p-6 flex-1 flex flex-col relative bg-white">
+                            <div className="text-[10px] font-bold text-orange-500 uppercase tracking-widest mb-2">{item.category}</div>
+                            <h3 className="text-lg sm:text-xl font-bold text-slate-900 mb-2 leading-tight group-hover:text-orange-600 transition-colors duration-300">{item.name}</h3>
+                            <p className="text-xs sm:text-sm text-gray-500 line-clamp-2 mb-6 flex-1 leading-relaxed">{item.description}</p>
+                            
+                            <button 
+                              onClick={() => addToCart(item)}
+                              className="w-full py-3 sm:py-3.5 bg-slate-900 text-white rounded-2xl font-semibold transition-all duration-300 flex items-center justify-center gap-2 active:scale-95 group-hover:bg-gradient-to-r group-hover:from-orange-500 group-hover:to-rose-500 group-hover:shadow-lg group-hover:shadow-orange-500/40 relative overflow-hidden text-sm sm:text-base"
+                            >
+                              <Plus className="w-4 h-4 sm:w-5 sm:h-5 transition-transform duration-500 group-hover:rotate-180"/> 
+                              <span className="relative z-10">Add to Order</span>
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </main>
+
+          {}
+          {showReadyAlert && (
+            <div className="fixed inset-0 z-[100] flex items-center justify-center bg-green-500/90 backdrop-blur-sm p-4">
+              <div className="bg-white p-8 rounded-3xl shadow-2xl max-w-sm w-full text-center animate-bounce">
+                 <div className="w-20 h-20 bg-green-100 text-green-500 rounded-full flex items-center justify-center mx-auto mb-4">
+                    <CheckCircle className="w-12 h-12" />
+                 </div>
+                 <h2 className="text-3xl font-bold text-slate-900 mb-2">Order Ready!</h2>
+                 <p className="text-gray-600 mb-6">Please collect your food at the counter.</p>
+                 <button onClick={() => window.location.reload()} className="w-full py-3 bg-green-500 text-white rounded-xl font-bold text-lg">Got it!</button>
+              </div>
+            </div>
+          )}
+
+          {!isCartOpen && cart.length > 0 && (
+            <button 
+              onClick={() => setIsCartOpen(true)}
+              className="fixed bottom-6 left-1/2 -translate-x-1/2 bg-orange-500 text-white px-5 py-3 sm:px-6 sm:py-4 rounded-full shadow-xl font-bold flex items-center gap-3 hover:bg-orange-600 transition-colors z-40 active:scale-95 text-sm sm:text-base whitespace-nowrap"
+            >
+              <div className="bg-white/20 px-2 py-1 rounded-md text-xs sm:text-sm">{cart.reduce((s,i)=>s+i.qty,0)}</div>
+              View Order • {formatRM(cartTotal)}
+            </button>
+          )}
+
+          {isCartOpen && (
+            <div className="fixed inset-0 z-50 flex justify-end">
+              <div className="absolute inset-0 bg-slate-900/60 backdrop-blur-sm" onClick={() => setIsCartOpen(false)}></div>
+              <div className="relative w-full max-w-md bg-gray-50 h-full shadow-2xl flex flex-col animate-in slide-in-from-right duration-300">
+                <div className="p-4 sm:p-6 bg-white border-b flex justify-between items-center z-10 shadow-sm">
+                  <h2 className="text-xl sm:text-2xl font-bold text-slate-900 flex items-center gap-2"><ShoppingCart className="w-6 h-6 text-orange-500"/> Your Order</h2>
+                  <button onClick={() => setIsCartOpen(false)} className="p-2 hover:bg-gray-100 rounded-full text-gray-500 transition-colors"><X className="w-6 h-6"/></button>
+                </div>
+
+                <div className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-4">
+                  {cart.map(item => (
+                    <div key={item.id} className="flex gap-4 bg-white p-4 rounded-2xl shadow-sm border border-gray-100 items-center">
+                       {item.image ? (
+                          <img src={item.image} alt={item.name} className="w-16 h-16 sm:w-20 sm:h-20 rounded-xl object-cover border border-gray-100" />
+                        ) : (
+                          <div className="w-16 h-16 sm:w-20 sm:h-20 rounded-xl bg-gray-50 flex items-center justify-center text-gray-300 border border-gray-100"><ImageIcon className="w-6 h-6"/></div>
+                        )}
+                      <div className="flex-1">
+                        <h4 className="font-bold text-slate-900 text-sm sm:text-base leading-tight mb-1">{item.name}</h4>
+                        <div className="font-extrabold text-orange-600 text-sm sm:text-base mb-2">{formatRM(item.price * item.qty)}</div>
+                        <div className="flex items-center gap-3">
+                          <button onClick={() => updateCartQty(item.id, -1)} className="p-1 sm:p-1.5 bg-gray-100 hover:bg-gray-200 text-slate-600 rounded-lg transition-colors"><Minus className="w-4 h-4"/></button>
+                          <span className="font-bold text-slate-900 w-4 text-center">{item.qty}</span>
+                          <button onClick={() => updateCartQty(item.id, 1)} className="p-1 sm:p-1.5 bg-gray-100 hover:bg-gray-200 text-slate-600 rounded-lg transition-colors"><Plus className="w-4 h-4"/></button>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                  {cart.length === 0 && (
+                    <div className="text-center text-gray-400 py-12 flex flex-col items-center">
+                      <ShoppingCart className="w-16 h-16 mb-4 opacity-20"/>
+                      <p>Your order is empty</p>
+                    </div>
+                  )}
+                </div>
+
+                {cart.length > 0 && (
+                  <div className="p-4 sm:p-6 bg-white border-t shadow-[0_-4px_20px_rgba(0,0,0,0.05)] z-10 pb-safe">
+                    <div className="flex justify-between items-center mb-6">
+                      <span className="text-gray-500 font-medium">Total Amount</span>
+                      <span className="text-2xl font-black text-slate-900">{formatRM(cartTotal)}</span>
+                    </div>
+                    <button onClick={openCheckoutPrompt} className="w-full py-4 bg-orange-500 text-white rounded-2xl font-bold text-lg hover:bg-orange-600 transition-all shadow-lg shadow-orange-500/30 active:scale-[0.98]">
+                      Proceed to Checkout
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {isCheckoutModalOpen && (
+            <div className="fixed inset-0 z-[60] flex items-end sm:items-center justify-center p-0 sm:p-4 pb-safe">
+              <div className="absolute inset-0 bg-slate-900/60 backdrop-blur-sm" onClick={() => setIsCheckoutModalOpen(false)}></div>
+              <div className="bg-white rounded-t-3xl sm:rounded-3xl w-full max-w-md p-6 sm:p-8 relative z-10 shadow-2xl animate-in slide-in-from-bottom sm:zoom-in-95 duration-300 max-h-[90vh] overflow-y-auto">
+                <button onClick={() => setIsCheckoutModalOpen(false)} className="absolute top-4 right-4 p-2 text-gray-400 hover:bg-gray-100 rounded-full transition-colors"><X className="w-6 h-6"/></button>
+                <h3 className="text-2xl font-bold text-slate-900 mb-6 pr-8">Complete Your Order</h3>
+                
+                <form onSubmit={submitOrder} className="space-y-6">
+                  <div className="grid grid-cols-2 gap-3 bg-gray-50 p-1.5 rounded-xl border border-gray-200">
+                    <button type="button" onClick={() => setDiningOption('dine-in')} className={`py-3 rounded-lg font-bold text-sm transition-all ${diningOption === 'dine-in' ? 'bg-white text-orange-500 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>Dine In</button>
+                    <button type="button" onClick={() => setDiningOption('takeaway')} className={`py-3 rounded-lg font-bold text-sm transition-all ${diningOption === 'takeaway' ? 'bg-white text-orange-500 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>Takeaway</button>
+                  </div>
+
+                  {diningOption === 'dine-in' && (
+                    <div className="animate-in fade-in slide-in-from-top-2">
+                      <label className="block text-sm font-bold text-slate-700 mb-2">Table Number <span className="text-red-500">*</span></label>
+                      <input type="number" min="1" required value={tableNumber} onChange={e => setTableNumber(e.target.value)} className="w-full p-4 bg-gray-50 border border-gray-200 rounded-xl focus:ring-2 focus:ring-orange-500 focus:bg-white outline-none text-lg font-bold text-center" placeholder="e.g. 5" />
+                    </div>
+                  )}
+
+                  <div>
+                     <label className="block text-sm font-bold text-slate-700 mb-2">WhatsApp Contact Number (Optional)</label>
+                     <p className="text-xs text-gray-500 mb-2">To receive a digital receipt directly to your WhatsApp.</p>
+                     <div className="relative">
+                        <Phone className="w-5 h-5 text-gray-400 absolute left-4 top-1/2 -translate-y-1/2" />
+                        <input 
+                          type="tel" 
+                          value={customerPhone} 
+                          onChange={e => setCustomerPhone(e.target.value)} 
+                          className="w-full pl-12 p-4 bg-gray-50 border border-gray-200 rounded-xl focus:ring-2 focus:ring-emerald-500 focus:bg-white outline-none font-medium" 
+                          placeholder="e.g. 0123456789" 
+                        />
+                     </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-bold text-slate-700 mb-2">Special Request (Optional)</label>
+                    <textarea rows="2" value={customerNote} onChange={e => setCustomerNote(e.target.value)} className="w-full p-4 bg-gray-50 border border-gray-200 rounded-xl focus:ring-2 focus:ring-orange-500 focus:bg-white outline-none text-sm resize-none" placeholder="e.g., Less spicy, no onions..."></textarea>
+                  </div>
+
+                  <div className="bg-orange-50 rounded-xl p-4 border border-orange-100">
+                    <div className="flex justify-between items-center mb-1">
+                      <span className="text-orange-800 text-sm font-medium">Total to Pay</span>
+                      <span className="text-xl font-black text-slate-900">{formatRM(cartTotal)}</span>
+                    </div>
+                    <p className="text-xs text-orange-600">Please pay at the cashier counter after ordering.</p>
+                  </div>
+
+                  <button type="submit" className="w-full py-4 bg-slate-900 text-white rounded-xl font-bold text-lg hover:bg-slate-800 transition-colors shadow-lg active:scale-[0.98]">
+                    Confirm & Send Order to Kitchen
+                  </button>
+                </form>
+              </div>
+            </div>
+          )}
+
+          {showAdminLogin && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-sm p-4">
+              <div className="bg-white rounded-2xl shadow-2xl max-w-sm w-full p-6 relative animate-in zoom-in-95 duration-200">
+                <button onClick={() => setShowAdminLogin(false)} className="absolute top-4 right-4 p-2 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-full"><X className="w-5 h-5"/></button>
+                <h3 className="text-xl font-bold text-slate-900 mb-4 flex items-center gap-2"><LogIn className="w-5 h-5"/> Staff Login</h3>
+                <form onSubmit={handleAdminLogin}>
+                  <input 
+                    type="password" 
+                    placeholder="Enter Access PIN" 
+                    value={adminPin}
+                    onChange={(e) => setAdminPin(e.target.value)}
+                    className="w-full p-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-orange-500 outline-none text-center text-lg tracking-widest font-mono mb-4"
+                    autoFocus
+                  />
+                  <button type="submit" className="w-full py-3 bg-slate-900 text-white rounded-xl font-bold hover:bg-slate-800 transition-colors">Login</button>
+                </form>
+              </div>
+            </div>
+          )}
+
+          {isWaiterBoardOpen && userRole === 'waiter' && (
+             <div className="fixed inset-0 z-[100] bg-gray-100 overflow-y-auto">
+                <div className="sticky top-0 bg-slate-900 text-white p-4 flex justify-between items-center shadow-md z-10">
+                   <h2 className="text-xl font-bold flex items-center gap-2"><ClipboardList className="w-5 h-5"/> Waiter View (Live Kitchen)</h2>
+                   <button onClick={() => setIsWaiterBoardOpen(false)} className="p-2 bg-slate-800 hover:bg-slate-700 rounded-full transition-colors"><X className="w-5 h-5"/></button>
+                </div>
+                <div className="p-4 sm:p-8 max-w-6xl mx-auto">
+                    {renderKitchenCards()}
+                </div>
+             </div>
+          )}
+
+        </div>
+      );
+
+      return ['admin', 'manager', 'cashier', 'architect'].includes(userRole) ? renderAdminDashboard() : renderCustomerView();
+    }
+
+    const root = createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
