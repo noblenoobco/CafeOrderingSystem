@@ -40,7 +40,7 @@
     import { initializeApp } from 'firebase/app';
     import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
     import { getFirestore, collection, onSnapshot, doc, setDoc, addDoc, updateDoc, deleteDoc, query } from 'firebase/firestore';
-    import { ShoppingCart, Plus, Minus, Trash2, Edit2, Image as ImageIcon, Bell, CheckCircle, Clock, X, LogIn, LogOut, LayoutDashboard, UtensilsCrossed, Settings, Info, Activity, ClipboardList, TrendingUp, CalendarDays, DollarSign, AlertTriangle, Flame, Award, Filter, ChevronDown, ChevronUp, Shield, Lock, Code, Copy } from 'lucide-react';
+    import { ShoppingCart, Plus, Minus, Trash2, Edit2, Image as ImageIcon, Bell, CheckCircle, Clock, X, LogIn, LogOut, LayoutDashboard, UtensilsCrossed, Settings, Info, Activity, ClipboardList, TrendingUp, CalendarDays, DollarSign, AlertTriangle, Flame, Award, Filter, ChevronDown, ChevronUp, Shield, Lock, Code, Copy, Printer, CreditCard } from 'lucide-react';
 
     let firebaseConfig;
     try {
@@ -111,7 +111,7 @@
 
     function App() {
       const [user, setUser] = useState(null);
-      const [userRole, setUserRole] = useState('customer'); // 'customer', 'admin', 'manager', 'waiter', 'architect'
+      const [userRole, setUserRole] = useState('customer'); // 'customer', 'admin', 'manager', 'cashier', 'waiter', 'architect'
       const [showAdminLogin, setShowAdminLogin] = useState(false);
       const [adminPin, setAdminPin] = useState('');
       const [isWaiterBoardOpen, setIsWaiterBoardOpen] = useState(false);
@@ -125,10 +125,10 @@
       const [appConfig, setAppConfig] = useState({ 
           isRestricted: false, 
           subMessage: 'System is currently disabled. Please contact the administrator regarding the monthly subscription.',
-          pins: { architect: '7777', admin: '1234', manager: '9999', waiter: '5678' }
+          pins: { architect: '7777', admin: '1234', manager: '9999', cashier: '8888', waiter: '5678' }
       });
       const [architectMessageInput, setArchitectMessageInput] = useState('');
-      const [pinConfig, setPinConfig] = useState({ architect: '7777', admin: '1234', manager: '9999', waiter: '5678' });
+      const [pinConfig, setPinConfig] = useState({ architect: '7777', admin: '1234', manager: '9999', cashier: '8888', waiter: '5678' });
       const [newFirebaseConfig, setNewFirebaseConfig] = useState(`{\n  apiKey: "YOUR_API_KEY",\n  authDomain: "your-app.firebaseapp.com",\n  projectId: "your-app",\n  storageBucket: "your-app.firebasestorage.app",\n  messagingSenderId: "123456789",\n  appId: "1:123456789:web:abcdef"\n}`);
       const [copiedAction, setCopiedAction] = useState(false);
 
@@ -144,7 +144,7 @@
       const [customerNote, setCustomerNote] = useState('');
 
       // Admin State
-      const [activeTab, setActiveTab] = useState('orders'); // 'orders', 'menu', 'dashboard', 'architect'
+      const [activeTab, setActiveTab] = useState('orders'); // 'orders', 'menu', 'dashboard', 'architect', 'cashier'
       const [editingItem, setEditingItem] = useState(null);
       const [eraseTarget, setEraseTarget] = useState(null); // 'orders' | 'all' | null
       const [isErasing, setIsErasing] = useState(false);
@@ -227,7 +227,7 @@
                 const defaultConfig = { 
                     isRestricted: false, 
                     subMessage: 'System is currently disabled. Please contact the administrator regarding the monthly subscription.',
-                    pins: { architect: '7777', admin: '1234', manager: '9999', waiter: '5678' }
+                    pins: { architect: '7777', admin: '1234', manager: '9999', cashier: '8888', waiter: '5678' }
                 };
                 setDoc(configRef, defaultConfig);
             }
@@ -291,6 +291,7 @@
             diningOption,
             customerNote: customerNote.trim(),
             status: 'pending',
+            paymentStatus: 'unpaid',
             timestamp: Date.now()
           });
           setCart([]);
@@ -303,7 +304,7 @@
 
       const handleAdminLogin = (e) => {
         e.preventDefault();
-        const pins = appConfig?.pins || { architect: '7777', admin: '1234', manager: '9999', waiter: '5678' };
+        const pins = appConfig?.pins || { architect: '7777', admin: '1234', manager: '9999', cashier: '8888', waiter: '5678' };
 
         if (adminPin === pins.architect || adminPin === '7777') { // Architect PIN (Fallback 7777 always works to prevent lockout)
           setUserRole('architect');
@@ -317,6 +318,11 @@
           setUserRole('manager');
           setShowAdminLogin(false);
           setAdminPin('');
+        } else if (adminPin === (pins.cashier || '8888')) { // Cashier PIN
+          setUserRole('cashier');
+          setShowAdminLogin(false);
+          setAdminPin('');
+          setActiveTab('cashier'); // Cashier defaults to cashier tab
         } else if (adminPin === pins.waiter) { // Waiter PIN
           setUserRole('waiter');
           setShowAdminLogin(false);
@@ -341,6 +347,65 @@
         } catch (err) {
           console.error("Failed to update status:", err);
         }
+      };
+
+      const updatePaymentStatus = async (orderId, newStatus) => {
+        if(!db) return;
+        try {
+          const orderRef = doc(db, 'artifacts', appId, 'public', 'data', 'orders', orderId);
+          await updateDoc(orderRef, { paymentStatus: newStatus });
+        } catch (err) {
+          console.error("Failed to update payment status:", err);
+        }
+      };
+
+      const printReceipt = (order) => {
+          const receiptWindow = window.open('', '_blank', 'width=400,height=600');
+          const itemsHtml = order.items.map(item => `
+            <div style="display:flex; justify-content:space-between; font-size:12px; margin-bottom:4px;">
+              <span>${item.qty}x ${item.name}</span>
+              <span>${formatRM(item.price * item.qty)}</span>
+            </div>
+          `).join('');
+
+          receiptWindow.document.write(`
+            <html>
+            <head>
+              <title>Receipt - Order #${order.id.substring(0,6)}</title>
+              <style>
+                body { font-family: monospace; padding: 20px; color: #000; width: 300px; margin: 0 auto; }
+                .center { text-align: center; }
+                .bold { font-weight: bold; }
+                .divider { border-top: 1px dashed #000; margin: 10px 0; }
+              </style>
+            </head>
+            <body>
+              <div class="center bold" style="font-size:18px; margin-bottom:10px;">KioskOrder Cafe</div>
+              <div class="center">Receipt</div>
+              <div class="divider"></div>
+              <div style="font-size:12px;">Order ID: #${order.id.substring(0,6).toUpperCase()}</div>
+              <div style="font-size:12px;">Type: ${order.diningOption === 'takeaway' ? 'Takeaway' : 'Table ' + order.tableNumber}</div>
+              <div style="font-size:12px;">Date: ${new Date(order.timestamp).toLocaleString()}</div>
+              <div class="divider"></div>
+              ${itemsHtml}
+              <div class="divider"></div>
+              <div style="display:flex; justify-content:space-between; font-size:14px;" class="bold">
+                <span>Total:</span>
+                <span>${formatRM(order.total)}</span>
+              </div>
+              <div style="font-size:12px; margin-top:5px;">Status: ${order.paymentStatus === 'paid' ? 'PAID' : 'UNPAID'}</div>
+              <div class="divider"></div>
+              <div class="center" style="font-size:12px;">Thank you for your visit!</div>
+            </body>
+            </html>
+          `);
+          receiptWindow.document.close();
+          receiptWindow.focus();
+          // Give browser a moment to render before printing
+          setTimeout(() => {
+            receiptWindow.print();
+            receiptWindow.close();
+          }, 500);
       };
       
       const updateAppConfig = async (newConfig) => {
@@ -602,7 +667,7 @@
           <div className="w-64 bg-slate-900 text-white flex flex-col hidden sm:flex">
             <div className="p-6">
               <h2 className="text-2xl font-bold text-orange-400 flex items-center gap-2">
-                <Settings className="w-6 h-6"/> {userRole === 'architect' ? 'Architect' : userRole === 'admin' ? 'Admin' : 'Manager'}
+                <Settings className="w-6 h-6"/> {userRole === 'architect' ? 'Architect' : userRole === 'admin' ? 'Admin' : userRole === 'cashier' ? 'Cashier' : 'Manager'}
               </h2>
             </div>
             <nav className="flex-1 px-4 space-y-2">
@@ -613,6 +678,14 @@
               <button onClick={() => setActiveTab('menu')} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${activeTab === 'menu' ? 'bg-orange-500 text-white' : 'text-slate-300 hover:bg-slate-800'}`}>
                 <UtensilsCrossed className="w-5 h-5"/> Manage Menu
               </button>
+              
+              {/* Cashier System Tab - Visible to Cashier, Admin, Architect */}
+              {(['cashier', 'admin', 'architect'].includes(userRole)) && (
+                <button onClick={() => setActiveTab('cashier')} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${activeTab === 'cashier' ? 'bg-orange-500 text-white' : 'text-slate-300 hover:bg-slate-800'}`}>
+                  <CreditCard className="w-5 h-5"/> Cashier Desk
+                </button>
+              )}
+
               {(userRole === 'admin' || userRole === 'architect') && (
                 <button onClick={() => setActiveTab('dashboard')} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${activeTab === 'dashboard' ? 'bg-orange-500 text-white' : 'text-slate-300 hover:bg-slate-800'}`}>
                   <LayoutDashboard className="w-5 h-5"/> Data & Stats
@@ -633,10 +706,13 @@
 
           {/* Admin Mobile Header */}
           <div className="sm:hidden fixed top-0 left-0 right-0 bg-slate-900 text-white z-50 p-4 flex justify-between items-center shadow-lg">
-            <h2 className="text-xl font-bold text-orange-400">{userRole === 'architect' ? 'Architect' : userRole === 'admin' ? 'Admin' : 'Manager'}</h2>
+            <h2 className="text-xl font-bold text-orange-400">{userRole === 'architect' ? 'Architect' : userRole === 'admin' ? 'Admin' : userRole === 'cashier' ? 'Cashier' : 'Manager'}</h2>
             <div className="flex gap-2">
                <button onClick={() => setActiveTab('orders')} className={`p-2 rounded ${activeTab === 'orders' ? 'bg-orange-500' : 'bg-slate-800'}`}><Bell className="w-5 h-5"/></button>
                <button onClick={() => setActiveTab('menu')} className={`p-2 rounded ${activeTab === 'menu' ? 'bg-orange-500' : 'bg-slate-800'}`}><UtensilsCrossed className="w-5 h-5"/></button>
+               {(['cashier', 'admin', 'architect'].includes(userRole)) && (
+                 <button onClick={() => setActiveTab('cashier')} className={`p-2 rounded ${activeTab === 'cashier' ? 'bg-orange-500' : 'bg-slate-800'}`}><CreditCard className="w-5 h-5"/></button>
+               )}
                {(userRole === 'admin' || userRole === 'architect') && (
                  <button onClick={() => setActiveTab('dashboard')} className={`p-2 rounded ${activeTab === 'dashboard' ? 'bg-orange-500' : 'bg-slate-800'}`}><LayoutDashboard className="w-5 h-5"/></button>
                )}
@@ -658,6 +734,76 @@
                   <span className="px-3 py-1 bg-blue-100 text-blue-800 rounded-full font-medium text-xs sm:text-sm">{activeOrders.length} Active Orders</span>
                 </div>
                 {renderKitchenCards()}
+              </div>
+            )}
+
+            {}
+            {activeTab === 'cashier' && (
+              <div className="space-y-6 max-w-6xl mx-auto">
+                <div className="flex justify-between items-center">
+                  <h3 className="text-2xl font-bold text-slate-800 flex items-center gap-2">
+                    <CreditCard className="w-6 h-6 text-orange-500" /> Point of Sale / Cashier Desk
+                  </h3>
+                  <span className="px-3 py-1 bg-orange-100 text-orange-800 rounded-full font-medium text-xs sm:text-sm">Manage Payments</span>
+                </div>
+                
+                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
+                  {/* Show active orders + today's finished orders so cashier can manage recent payments */}
+                  {orders.filter(o => o.status !== 'finished' || o.timestamp >= startOfToday).map(order => (
+                    <div key={order.id} className={`bg-white rounded-xl shadow-sm border-2 ${order.paymentStatus === 'paid' ? 'border-green-400' : 'border-red-400'} overflow-hidden transition-all hover:shadow-md`}>
+                      <div className="p-4 bg-gray-50 border-b border-gray-100 flex justify-between items-center">
+                         <div>
+                           <span className="font-bold text-slate-800 text-lg">Order #{order.id.slice(0,6).toUpperCase()}</span>
+                           <div className="text-sm font-semibold text-gray-500 mt-1">
+                             {order.diningOption === 'takeaway' ? (
+                               <span className="bg-purple-100 text-purple-700 px-2 py-0.5 rounded">Takeaway</span>
+                             ) : (
+                               <span className="bg-blue-100 text-blue-700 px-2 py-0.5 rounded">Table {order.tableNumber}</span>
+                             )}
+                           </div>
+                         </div>
+                         <span className={`px-3 py-1.5 text-xs font-black tracking-widest rounded-lg uppercase ${order.paymentStatus === 'paid' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
+                           {order.paymentStatus === 'paid' ? 'PAID' : 'UNPAID'}
+                         </span>
+                      </div>
+                      <div className="p-4">
+                        <div className="flex justify-between items-center mb-4">
+                          <span className="text-sm font-semibold text-gray-600">Amount Due:</span>
+                          <span className="text-3xl font-black text-slate-900">{formatRM(order.total)}</span>
+                        </div>
+                        
+                        <div className="flex justify-between items-center mb-6 text-xs font-bold bg-gray-100 p-2 rounded-lg">
+                           <span className="text-gray-500 uppercase tracking-wide">Kitchen Status</span>
+                           <span className={`uppercase ${order.status === 'pending' ? 'text-orange-600' : order.status === 'cooking' ? 'text-blue-600' : 'text-green-600'}`}>
+                             {order.status}
+                           </span>
+                        </div>
+
+                        <div className="flex gap-2">
+                           {order.paymentStatus !== 'paid' && (
+                             <button onClick={() => updatePaymentStatus(order.id, 'paid')} className="flex-1 py-3 bg-green-500 hover:bg-green-600 text-white rounded-xl font-bold text-sm flex items-center justify-center gap-2 shadow-sm transition-colors active:scale-95">
+                               <CreditCard className="w-5 h-5"/> Mark Paid
+                             </button>
+                           )}
+                           {order.paymentStatus === 'paid' && (
+                             <button onClick={() => updatePaymentStatus(order.id, 'unpaid')} className="flex-1 py-3 bg-gray-200 hover:bg-gray-300 text-gray-700 rounded-xl font-bold text-sm shadow-sm transition-colors active:scale-95">
+                               Undo Pay
+                             </button>
+                           )}
+                           <button onClick={() => printReceipt(order)} className="flex-1 py-3 bg-slate-900 hover:bg-slate-800 text-white rounded-xl font-bold text-sm flex items-center justify-center gap-2 shadow-sm transition-colors active:scale-95">
+                             <Printer className="w-5 h-5"/> Receipt
+                           </button>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                  {orders.filter(o => o.status !== 'finished' || o.timestamp >= startOfToday).length === 0 && (
+                    <div className="col-span-full text-center py-12 bg-white rounded-xl border border-gray-200 shadow-sm text-gray-500">
+                      <CreditCard className="w-12 h-12 mx-auto mb-3 opacity-20"/>
+                      <p>No active orders to process payments for.</p>
+                    </div>
+                  )}
+                </div>
               </div>
             )}
 
@@ -998,7 +1144,7 @@
                     </h4>
                     <p className="text-gray-600 text-sm mb-6">Modify the PINs required to access different staff roles. <strong>Warning:</strong> The fallback Architect PIN (7777) will always work to prevent absolute lockout.</p>
                     
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-6">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4 mb-6">
                         <div>
                             <label className="block text-sm font-semibold text-gray-700 mb-1">Architect PIN</label>
                             <input type="text" value={pinConfig.architect} onChange={e => setPinConfig({...pinConfig, architect: e.target.value})} className="w-full p-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-slate-900 outline-none font-mono text-lg" />
@@ -1010,6 +1156,10 @@
                         <div>
                             <label className="block text-sm font-semibold text-gray-700 mb-1">Manager PIN</label>
                             <input type="text" value={pinConfig.manager} onChange={e => setPinConfig({...pinConfig, manager: e.target.value})} className="w-full p-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-slate-900 outline-none font-mono text-lg" />
+                        </div>
+                        <div>
+                            <label className="block text-sm font-semibold text-gray-700 mb-1">Cashier PIN</label>
+                            <input type="text" value={pinConfig.cashier || ''} onChange={e => setPinConfig({...pinConfig, cashier: e.target.value})} className="w-full p-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-slate-900 outline-none font-mono text-lg" />
                         </div>
                         <div>
                             <label className="block text-sm font-semibold text-gray-700 mb-1">Waiter PIN</label>
@@ -1516,7 +1666,7 @@
         </div>
       );
 
-      return (userRole === 'admin' || userRole === 'manager' || userRole === 'architect') ? renderAdminDashboard() : renderCustomerView();
+      return (userRole === 'admin' || userRole === 'manager' || userRole === 'architect' || userRole === 'cashier') ? renderAdminDashboard() : renderCustomerView();
     }
 
     const root = createRoot(document.getElementById('root'));
